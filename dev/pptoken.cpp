@@ -1,11 +1,35 @@
 #include <cstdlib>
 #include <iostream>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 
 #include "preprocess/tokens/DebugPPTokenStream.h"
 #include "preprocess/tokens/PPTokenizer.h"
+
+namespace
+{
+
+std::string ReadStandardInput()
+{
+	std::string input;
+	char input_chunk[64 * 1024];
+	for (;;)
+	{
+		std::cin.read(input_chunk, sizeof(input_chunk));
+		const std::streamsize bytes_read = std::cin.gcount();
+		if (bytes_read > 0)
+			input.append(input_chunk, static_cast<std::size_t>(bytes_read));
+		if (std::cin.bad())
+			throw std::runtime_error("failed to read source input");
+		if (std::cin.eof())
+			break;
+		if (!std::cin)
+			throw std::runtime_error("failed to read source input");
+	}
+	return input;
+}
+
+} // namespace
 
 int main(int argc, char** argv)
 {
@@ -13,11 +37,9 @@ int main(int argc, char** argv)
 	(void)argv;
 	try
 	{
-		std::ostringstream input_stream;
-		input_stream << std::cin.rdbuf();
-		const std::string input = input_stream.str();
+		const std::string source = ReadStandardInput();
 		DebugPPTokenStream output;
-		TokenizePreprocessingSource(input, output);
+		TokenizePreprocessingSource(source, output);
 		return EXIT_SUCCESS;
 	}
 	catch (const std::exception& error)

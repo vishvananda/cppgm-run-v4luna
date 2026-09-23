@@ -1,61 +1,50 @@
 // (C) 2013 CPPGM Foundation www.cppgm.org.  All rights reserved.
 
+#include <cstdlib>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 
-using namespace std;
+#include "preprocess/control_expression.h"
 
-#include "support/not_implemented.h"
-
-// mock implementation of IsDefinedIdentifier for PA3
-// return true iff first code point is odd
-bool PA3Mock_IsDefinedIdentifier(const string& identifier)
+namespace
 {
-	if (identifier.empty())
-		return false;
-	else
-		return identifier[0] % 2;
-}
 
-bool HasBatchStdinArg(int argc, char** argv)
+std::string ReadStandardInput()
 {
-	for (int i = 1; i < argc; i++)
+	std::string input;
+	char input_chunk[64 * 1024];
+	for (;;)
 	{
-		if (string(argv[i]) == "--batch-stdin")
-			return true;
+		std::cin.read(input_chunk, sizeof(input_chunk));
+		const std::streamsize bytes_read = std::cin.gcount();
+		if (bytes_read > 0)
+			input.append(input_chunk, static_cast<std::size_t>(bytes_read));
+		if (std::cin.bad())
+			throw std::runtime_error("failed to read source input");
+		if (std::cin.eof())
+			break;
+		if (!std::cin)
+			throw std::runtime_error("failed to read source input");
 	}
-	return false;
+	return input;
 }
 
-int RunNotImplementedBatchMode()
-{
-	string line;
-	while (getline(cin, line))
-	{
-		(void)line;
-		cout << "EXIT_NOT_IMPLEMENTED" << endl;
-	}
-	return EXIT_SUCCESS;
-}
+} // namespace
 
 int main(int argc, char** argv)
 {
+	(void)argc;
+	(void)argv;
 	try
 	{
-		if (HasBatchStdinArg(argc, argv))
-			return RunNotImplementedBatchMode();
-
-		// TODO: Implement ppexpr as per PA3 assignment description
-		throw NotImplementedException();
+		const std::string source = ReadStandardInput();
+		EvaluateControlExpressions(source, std::cout);
+		return EXIT_SUCCESS;
 	}
-	catch (const NotImplementedException& e)
+	catch (const std::exception& error)
 	{
-		cerr << "ERROR: " << e.what() << endl;
-		return CPPGM_EXIT_NOT_IMPLEMENTED;
-	}
-	catch (exception& e)
-	{
-		cerr << "ERROR: " << e.what() << endl;
+		std::cerr << "ERROR: " << error.what() << std::endl;
 		return EXIT_FAILURE;
 	}
 }

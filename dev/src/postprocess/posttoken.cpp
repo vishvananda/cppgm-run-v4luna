@@ -1113,6 +1113,58 @@ void PostTokenizeNumber(DebugPostTokenOutputStream& output, const string& source
 namespace
 {
 
+bool IsUnsignedIntegralType(EFundamentalType type)
+{
+	switch (type)
+	{
+	case FT_UNSIGNED_CHAR:
+	case FT_UNSIGNED_SHORT_INT:
+	case FT_UNSIGNED_INT:
+	case FT_UNSIGNED_LONG_INT:
+	case FT_UNSIGNED_LONG_LONG_INT:
+	case FT_CHAR16_T:
+	case FT_CHAR32_T:
+		return true;
+	default:
+		return false;
+	}
+}
+
+} // namespace
+
+bool ParsePPIntegralLiteral(const string& spelling, PPIntegralLiteral& result)
+{
+	if (spelling.find('_') != string::npos)
+		return false;
+	char floating_suffix = 0;
+	if (ParseFloatingCore(spelling, floating_suffix))
+		return false;
+
+	size_t suffix_begin = spelling.size();
+	while (suffix_begin > 0 &&
+		(spelling[suffix_begin - 1] == 'u' ||
+		 spelling[suffix_begin - 1] == 'U' ||
+		 spelling[suffix_begin - 1] == 'l' ||
+		 spelling[suffix_begin - 1] == 'L'))
+		--suffix_begin;
+	const string core_spelling = spelling.substr(0, suffix_begin);
+	const string suffix = spelling.substr(suffix_begin);
+	IntegerCore core;
+	bool is_unsigned = false;
+	unsigned long_count = 0;
+	EFundamentalType type;
+	if (!ParseIntegerCore(core_spelling, core) ||
+		!ParseIntegerSuffix(suffix, is_unsigned, long_count) ||
+		!SelectIntegerType(core, is_unsigned, long_count, type))
+		return false;
+	result.value = core.value;
+	result.is_unsigned = IsUnsignedIntegralType(type);
+	return true;
+}
+
+namespace
+{
+
 struct LiteralView
 {
 	string encoding;
@@ -1614,3 +1666,35 @@ void PostTokenizeCharacter(DebugPostTokenOutputStream& output,
 }
 
 } // namespace
+
+bool ParsePPCharacterLiteral(const string& spelling,
+	const vector<size_t>& ucn_backslash_offsets, PPIntegralLiteral& result)
+{
+	LiteralView view;
+	vector<DecodedAtom> atoms;
+	if (!SplitLiteral(spelling, '\'', view) || view.raw ||
+		!view.suffix.empty() ||
+		!DecodeLiteralContent(spelling, view, ucn_backslash_offsets, atoms) ||
+		atoms.size() != 1 || !IsUnicodeScalar(atoms[0].value))
+		return false;
+
+	const uint32_t value = atoms[0].value;
+	EFundamentalType type;
+	if (view.encoding.empty())
+		type = value <= 127 ? FT_CHAR : FT_INT;
+	else if (view.encoding == "u")
+	{
+		if (value > 0xFFFF) return false;
+		type = FT_CHAR16_T;
+	}
+	else if (view.encoding == "U")
+		type = FT_CHAR32_T;
+	else if (view.encoding == "L")
+		type = FT_WCHAR_T;
+	else
+		return false;
+
+	result.value = value;
+	result.is_unsigned = IsUnsignedIntegralType(type);
+	return true;
+}

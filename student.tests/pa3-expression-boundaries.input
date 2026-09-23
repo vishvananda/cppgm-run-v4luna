@@ -1,0 +1,31 @@
+not 2
+compl 2
+2 bitand 3
+2 xor 3
+2 bitor 3
+2 and 0
+2 or 0
+2 not_eq 3
+
+defined é
+defined 中
+defined true
+defined false
+false ? 5 / 0u : -5
+false ? 5 : (1u < 2u)
+false ? 5 : (1u == 1u)
+true ? 5 : (1u + 2u)
+0 && (5 / 0)
+1 || (1 << 64)
+1 << 63
+-2 << 1
+521 << 62
+1 << 60 << 60
+9223372036854775807 + 1
+0xffffffffffffffffu + 1u
+1 + \
+ 2
+// comment-only logical line
+1.5
+"text"
+1 +

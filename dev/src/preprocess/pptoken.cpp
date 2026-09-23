@@ -801,10 +801,9 @@ private:
 		std::string data;
 		CodePoint start;
 		CodePoint last;
-		consumePrefix(prefix, data, start, last);
-		const int quote = prefix.character ? '\'' : '"';
-		bool has_content = false;
-		for (;;)
+	consumePrefix(prefix, data, start, last);
+	const int quote = prefix.character ? '\'' : '"';
+	for (;;)
 		{
 			const CodePoint point = cursor_.peek();
 			if (point.value == EndOfFile || point.value == '\n')
@@ -819,21 +818,17 @@ private:
 				const LexChar universal = decodeLexCharAt(0, true);
 				if (universal.source_units > 1)
 				{
-					consumeUnits(universal.source_units);
-					AppendUtf8(data, universal.value);
-					has_content = true;
-					continue;
-				}
-				scanEscapeSequence(data);
-				has_content = true;
+				consumeUnits(universal.source_units);
+				AppendUtf8(data, universal.value);
 				continue;
 			}
-			AppendUtf8(data, static_cast<uint32_t>(cursor_.consume().value));
-			has_content = true;
+			scanEscapeSequence(data);
+			continue;
 		}
-		if (prefix.character && !has_content)
-			throw std::runtime_error("empty character literal");
-
+		AppendUtf8(data, static_cast<uint32_t>(cursor_.consume().value));
+		}
+		// Preserve an empty character preprocessing token so PA2 can report its
+		// failed conversion as one invalid token and continue the stream.
 		TokenKind kind = prefix.character ? CharacterLiteral : StringLiteral;
 		appendUserDefinedSuffix(data, kind);
 		emitToken(kind, data, start);
@@ -1091,4 +1086,29 @@ void TokenizePreprocessingSource(const std::string& source,
 {
 	PPTokenizer tokenizer(source, output);
 	tokenizer.run();
+}
+
+bool IsValidIdentifierName(const std::string& spelling)
+{
+	if (spelling.empty())
+		return false;
+	size_t offset = 0;
+	bool first = true;
+	try
+	{
+		while (offset < spelling.size())
+		{
+			size_t width = 0;
+			const uint32_t value = DecodeUtf8(spelling, offset, width);
+			if (first ? !IsIdentifierStart(value) : !IsIdentifierBody(value))
+				return false;
+		offset += width;
+			first = false;
+		}
+	}
+	catch (const std::exception&)
+	{
+		return false;
+	}
+	return true;
 }

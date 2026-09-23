@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <string>
+#include <vector>
 
 struct IPPTokenStream
 {
@@ -22,6 +23,22 @@ struct IPPTokenStream
 	virtual void emit_user_defined_character_literal(const std::string& data) = 0;
 	virtual void emit_string_literal(const std::string& data) = 0;
 	virtual void emit_user_defined_string_literal(const std::string& data) = 0;
+	// Literal spellings expose decoded UCNs to the PA1 output contract. Keep
+	// offsets for UCNs that decode to backslash so later literal conversion
+	// does not mistake them for the start of an escape sequence. The defaults
+	// preserve older consumers that only need the decoded spelling.
+	virtual void emit_character_literal(const std::string& data,
+		const std::vector<std::size_t>& ucn_backslash_offsets)
+		{ (void)ucn_backslash_offsets; emit_character_literal(data); }
+	virtual void emit_user_defined_character_literal(const std::string& data,
+		const std::vector<std::size_t>& ucn_backslash_offsets)
+		{ (void)ucn_backslash_offsets; emit_user_defined_character_literal(data); }
+	virtual void emit_string_literal(const std::string& data,
+		const std::vector<std::size_t>& ucn_backslash_offsets)
+		{ (void)ucn_backslash_offsets; emit_string_literal(data); }
+	virtual void emit_user_defined_string_literal(const std::string& data,
+		const std::vector<std::size_t>& ucn_backslash_offsets)
+		{ (void)ucn_backslash_offsets; emit_user_defined_string_literal(data); }
 	virtual void emit_preprocessing_op_or_punc(const std::string& data) = 0;
 	virtual void emit_non_whitespace_char(const std::string& data) = 0;
 	virtual void emit_eof() = 0;

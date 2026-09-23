@@ -1,0 +1,11 @@
+user-defined-literal "\n" "x"_x _x string array of 4 char 5C6E7800
+simple ; OP_SEMICOLON
+user-defined-literal "\x41"_x _x string array of 5 char 5C78343100
+simple ; OP_SEMICOLON
+simple operator KW_OPERATOR
+user-defined-literal "abc"_x _x string array of 4 char 61626300
+simple ; OP_SEMICOLON
+literal '\' char 5C
+simple ; OP_SEMICOLON
+invalid '\n'
+eof

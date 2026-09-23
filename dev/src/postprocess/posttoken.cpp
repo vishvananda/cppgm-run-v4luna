@@ -1131,18 +1131,20 @@ struct DecodedAtom
 
 bool SplitLiteral(const string& source, char quote, LiteralView& view);
 bool DecodeLiteralContent(const string& source, const LiteralView& view,
-	vector<DecodedAtom>& atoms);
+	const vector<size_t>& ucn_backslash_offsets, vector<DecodedAtom>& atoms);
 size_t EncodingWidth(const string& encoding);
 EFundamentalType StringElementType(const string& encoding);
 bool AppendStringAtom(vector<unsigned char>& bytes, const DecodedAtom& atom,
 	const string& encoding, size_t width);
 void PostTokenizeCharacter(DebugPostTokenOutputStream& output,
-	const string& source, bool user_defined);
+	const string& source, bool user_defined,
+	const vector<size_t>& ucn_backslash_offsets);
 
 struct StringPart
 {
 	string source;
 	bool user_defined;
+	vector<size_t> ucn_backslash_offsets;
 };
 
 size_t EncodingWidth(const string& encoding)
@@ -1226,41 +1228,74 @@ public:
 	{
 		FlushStringRun();
 		operator_literal_pending_ = false;
-		PostTokenizeCharacter(output_, data, false);
+		PostTokenizeCharacter(output_, data, false, vector<size_t>());
+	}
+
+	void emit_character_literal(const string& data,
+		const vector<size_t>& ucn_backslash_offsets)
+	{
+		FlushStringRun();
+		operator_literal_pending_ = false;
+		PostTokenizeCharacter(output_, data, false, ucn_backslash_offsets);
 	}
 
 	void emit_user_defined_character_literal(const string& data)
 	{
 		FlushStringRun();
 		operator_literal_pending_ = false;
-		PostTokenizeCharacter(output_, data, true);
+		PostTokenizeCharacter(output_, data, true, vector<size_t>());
+	}
+
+	void emit_user_defined_character_literal(const string& data,
+		const vector<size_t>& ucn_backslash_offsets)
+	{
+		FlushStringRun();
+		operator_literal_pending_ = false;
+		PostTokenizeCharacter(output_, data, true, ucn_backslash_offsets);
 	}
 
 	void emit_string_literal(const string& data)
 	{
-		AddStringToken(data, false);
+		AddStringToken(data, false, vector<size_t>());
+	}
+
+	void emit_string_literal(const string& data,
+		const vector<size_t>& ucn_backslash_offsets)
+	{
+		AddStringToken(data, false, ucn_backslash_offsets);
 	}
 
 	void emit_user_defined_string_literal(const string& data)
+	{
+		emit_user_defined_string_literal(data, vector<size_t>());
+	}
+
+	void emit_user_defined_string_literal(const string& data,
+		const vector<size_t>& ucn_backslash_offsets)
 	{
 		if (operator_literal_pending_)
 		{
 			FlushStringRun();
 			LiteralView view = {};
-			if (!SplitLiteral(data, '"', view) || view.suffix.empty())
+			if (!SplitLiteral(data, '"', view) || view.suffix.empty() ||
+				view.suffix_begin != 2 || data.compare(0, 2, "\"\"") != 0)
 			{
 				operator_literal_pending_ = false;
-				AddStringToken(data, true);
+				AddStringToken(data, true, ucn_backslash_offsets);
 				return;
 			}
 			const string literal_source = data.substr(0, view.suffix_begin);
-			AddStringToken(literal_source, false);
+			vector<size_t> literal_ucn_offsets;
+			for (size_t i = 0; i < ucn_backslash_offsets.size(); ++i)
+				if (ucn_backslash_offsets[i] < view.suffix_begin)
+					literal_ucn_offsets.push_back(ucn_backslash_offsets[i]);
+			AddStringToken(literal_source, false, literal_ucn_offsets);
 			FlushStringRun();
 			output_.emit_identifier(view.suffix);
 			operator_literal_pending_ = false;
 			return;
 		}
-		AddStringToken(data, true);
+		AddStringToken(data, true, ucn_backslash_offsets);
 	}
 
 	void emit_preprocessing_op_or_punc(const string& data)
@@ -1298,10 +1333,11 @@ private:
 	vector<StringPart> string_run_;
 	bool operator_literal_pending_;
 
-	void AddStringToken(const string& source, bool user_defined)
+	void AddStringToken(const string& source, bool user_defined,
+		const vector<size_t>& ucn_backslash_offsets)
 	{
 		operator_literal_pending_ = false;
-		StringPart part = {source, user_defined};
+		StringPart part = {source, user_defined, ucn_backslash_offsets};
 		string_run_.push_back(part);
 	}
 
@@ -1346,7 +1382,8 @@ private:
 			for (size_t i = 0; i < string_run_.size() && !invalid; ++i)
 			{
 				vector<DecodedAtom> atoms;
-				if (!DecodeLiteralContent(string_run_[i].source, views[i], atoms))
+				if (!DecodeLiteralContent(string_run_[i].source, views[i],
+					string_run_[i].ucn_backslash_offsets, atoms))
 				{
 					invalid = true;
 					break;
@@ -1493,12 +1530,21 @@ bool DecodeEscapeValue(const string& source, size_t& position, size_t end,
 }
 
 bool DecodeLiteralContent(const string& source, const LiteralView& view,
-	vector<DecodedAtom>& atoms)
+	const vector<size_t>& ucn_backslash_offsets, vector<DecodedAtom>& atoms)
 {
 	size_t position = view.content_begin;
+	size_t ucn_index = 0;
+	while (ucn_index < ucn_backslash_offsets.size() &&
+		ucn_backslash_offsets[ucn_index] < position)
+		++ucn_index;
 	while (position < view.content_end)
 	{
-		if (!view.raw && source[position] == '\\')
+		while (ucn_index < ucn_backslash_offsets.size() &&
+			ucn_backslash_offsets[ucn_index] < position)
+			++ucn_index;
+		const bool ucn_backslash = ucn_index < ucn_backslash_offsets.size() &&
+			ucn_backslash_offsets[ucn_index] == position;
+		if (!view.raw && source[position] == '\\' && !ucn_backslash)
 		{
 			DecodedAtom atom;
 			if (!DecodeEscapeValue(source, position, view.content_end, atom))
@@ -1506,6 +1552,7 @@ bool DecodeLiteralContent(const string& source, const LiteralView& view,
 			atoms.push_back(atom);
 			continue;
 		}
+		if (ucn_backslash) ++ucn_index;
 		Utf8Point point;
 		if (!DecodeUtf8Point(source, position, point) ||
 			point.width > view.content_end - position)
@@ -1518,12 +1565,14 @@ bool DecodeLiteralContent(const string& source, const LiteralView& view,
 }
 
 void PostTokenizeCharacter(DebugPostTokenOutputStream& output,
-	const string& source, bool user_defined)
+	const string& source, bool user_defined,
+	const vector<size_t>& ucn_backslash_offsets)
 {
 	LiteralView view;
 	vector<DecodedAtom> atoms;
 	if (!SplitLiteral(source, '\'', view) || view.raw ||
-		!DecodeLiteralContent(source, view, atoms) || atoms.size() != 1 ||
+		!DecodeLiteralContent(source, view, ucn_backslash_offsets, atoms) ||
+		atoms.size() != 1 ||
 		!IsUnicodeScalar(atoms[0].value) ||
 		(user_defined ? !IsValidUdSuffix(view.suffix) : !view.suffix.empty()))
 	{

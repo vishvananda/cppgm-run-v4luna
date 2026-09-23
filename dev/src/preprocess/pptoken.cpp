@@ -4,6 +4,7 @@
 #include <deque>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -799,11 +800,12 @@ private:
 	void scanQuotedLiteral(const LiteralPrefix& prefix)
 	{
 		std::string data;
+		std::vector<size_t> ucn_backslash_offsets;
 		CodePoint start;
 		CodePoint last;
-	consumePrefix(prefix, data, start, last);
-	const int quote = prefix.character ? '\'' : '"';
-	for (;;)
+		consumePrefix(prefix, data, start, last);
+		const int quote = prefix.character ? '\'' : '"';
+		for (;;)
 		{
 			const CodePoint point = cursor_.peek();
 			if (point.value == EndOfFile || point.value == '\n')
@@ -818,9 +820,11 @@ private:
 				const LexChar universal = decodeLexCharAt(0, true);
 				if (universal.source_units > 1)
 				{
-				consumeUnits(universal.source_units);
-				AppendUtf8(data, universal.value);
-				continue;
+					consumeUnits(universal.source_units);
+					if (universal.value == '\\')
+						ucn_backslash_offsets.push_back(data.size());
+					AppendUtf8(data, universal.value);
+					continue;
 			}
 			scanEscapeSequence(data);
 			continue;
@@ -831,7 +835,34 @@ private:
 		// failed conversion as one invalid token and continue the stream.
 		TokenKind kind = prefix.character ? CharacterLiteral : StringLiteral;
 		appendUserDefinedSuffix(data, kind);
-		emitToken(kind, data, start);
+		emitQuotedToken(kind, data, ucn_backslash_offsets, start);
+	}
+
+	void emitQuotedToken(TokenKind kind, const std::string& data,
+		const std::vector<size_t>& ucn_backslash_offsets,
+		const CodePoint& point)
+	{
+		setLocation(point);
+		switch (kind)
+		{
+		case CharacterLiteral:
+			output_.emit_character_literal(data, ucn_backslash_offsets);
+			break;
+		case UserDefinedCharacterLiteral:
+			output_.emit_user_defined_character_literal(data,
+				ucn_backslash_offsets);
+			break;
+		case StringLiteral:
+			output_.emit_string_literal(data, ucn_backslash_offsets);
+			break;
+		case UserDefinedStringLiteral:
+			output_.emit_user_defined_string_literal(data,
+				ucn_backslash_offsets);
+			break;
+		default:
+			throw std::logic_error("non-literal passed to emitQuotedToken");
+		}
+		observeToken(kind, data);
 	}
 
 	void scanEscapeSequence(std::string& data)

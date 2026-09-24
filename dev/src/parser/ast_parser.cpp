@@ -156,6 +156,7 @@ private:
     if (token_index >= tokens_.size()) return;
     const Token& source = tokens_[token_index];
     ast_.set_location(id, source.source_file_id, source.line, source.column);
+    if (ast_.nodes[id].source_start_token_index == none) ast_.nodes[id].source_start_token_index = token_index;
   }
   std::size_t composite_node(NodeKind kind, const std::string& text,
                              std::size_t source_token = none)
@@ -252,7 +253,7 @@ private:
       "int", "long", "short", "signed", "unsigned", "void", "wchar_t", "auto"};
     for (std::size_t i = 0; i < sizeof(words) / sizeof(words[0]); ++i)
       if (is_keyword(words[i])) return true;
-    return false;
+    return is("nullptr_t");
   }
   bool is_decl_modifier() const
   {
@@ -549,7 +550,7 @@ private:
     if (first.text == "class" || first.text == "struct" || first.text == "union" ||
         first.text == "enum" || first.text == "typename" || first.text == "decltype") return true;
     static const char* type_words[] = {"bool", "char", "char16_t", "char32_t", "double", "float",
-      "int", "long", "short", "signed", "unsigned", "void", "wchar_t", "auto", "const", "volatile"};
+      "int", "long", "nullptr_t", "short", "signed", "unsigned", "void", "wchar_t", "auto", "const", "volatile"};
     for (std::size_t i = 0; i < sizeof(type_words) / sizeof(type_words[0]); ++i)
       if (first.text == type_words[i]) return true;
     if (!is_type_token(1) && !qualified_type_name_ahead(1)) return false;
@@ -571,7 +572,7 @@ private:
         const Token& token = tokens_[next];
         static const char* starters[] = {"bool", "char", "char16_t", "char32_t", "class",
           "const", "decltype", "double", "enum", "float", "int", "long", "short",
-          "signed", "struct", "typename", "union", "unsigned", "void", "volatile", "wchar_t"};
+          "nullptr_t", "signed", "struct", "typename", "union", "unsigned", "void", "volatile", "wchar_t"};
         bool starts = token.text == "...";
         for (std::size_t j = 0; j < sizeof(starters) / sizeof(starters[0]); ++j)
           if (token.text == starters[j]) starts = true;
@@ -663,6 +664,7 @@ private:
         saw_type = true;
         continue;
       }
+      if (is("nullptr_t") && saw_type) break;
       if (is_builtin_type()) {
         std::size_t t = take();
         ast_.append(seq, atom_node(NDeclSpecifier, t));
@@ -817,7 +819,6 @@ private:
     }
     return false;
   }
-
   std::size_t parse_declaration(bool in_class)
   {
     skip_attribute_specifier();
@@ -1049,7 +1050,7 @@ private:
   bool type_starts_at(std::size_t offset) const
   {
     static const char* words[] = {"bool", "char", "char16_t", "char32_t", "double", "float",
-      "int", "long", "short", "signed", "unsigned", "void", "wchar_t", "const", "volatile"};
+      "int", "long", "nullptr_t", "short", "signed", "unsigned", "void", "wchar_t", "const", "volatile"};
     for (std::size_t i = 0; i < sizeof(words) / sizeof(words[0]); ++i)
       if (peek(offset).text == words[i]) return true;
     if (peek(offset).text == "class" || peek(offset).text == "struct" ||
@@ -1116,7 +1117,6 @@ private:
       }
     }
     if (!consume_template_close()) fail("unterminated template-id");
-
     std::string suffix;
     bool have_previous = false;
     bool previous_word = false;
@@ -1814,7 +1814,6 @@ private:
     expect(")"); expect(";");
     return n;
   }
-
   std::size_t parse_simple_or_function()
   {
     std::size_t spec = parse_decl_specifier_seq(true);
@@ -2258,7 +2257,6 @@ private:
     }
     return n;
   }
-
   std::size_t parse_compound_statement()
   {
     expect("{");
@@ -2276,7 +2274,12 @@ private:
   }
   std::size_t parse_block_item()
   {
-    if (!starts_decl_specifier()) return parse_statement();
+    if (!starts_decl_specifier() && !is_keyword("using") && !is_keyword("namespace")) return parse_statement(false);
+    const std::size_t declaration = try_parse_declaration_statement();
+    return declaration != none ? declaration : parse_statement(false);
+  }
+  std::size_t try_parse_declaration_statement()
+  {
     const std::size_t saved_pos = pos_, saved_nodes = ast_.nodes.size();
     const std::size_t saved_atoms = ast_.composite_atoms.size();
     const unsigned saved_pending_gt = pending_gt_;
@@ -2301,11 +2304,15 @@ private:
       namespace_inline_.resize(saved_namespace_inline);
       class_context_names_.resize(saved_class_context);
       class_scope_indices_.resize(saved_class_scopes);
-      return parse_statement();
+      return none;
     }
   }
-  std::size_t parse_statement()
+  std::size_t parse_statement(bool try_declaration = true)
   {
+    if (try_declaration && (starts_decl_specifier() || is_keyword("using"))) {
+      const std::size_t declaration = try_parse_declaration_statement();
+      if (declaration != none) return declaration;
+    }
     if (is("{")) return parse_compound_statement();
     if (is_keyword("if")) return parse_if();
     if (is_keyword("while")) return parse_while();
@@ -2483,7 +2490,6 @@ private:
     while (consume(",")) ast_.append(list, parse_init_declarator_tail(parse_declarator(false)));
     ast_.append(init, list); expect(";"); return init;
   }
-
   std::size_t parse_expression()
   {
     std::size_t lhs = parse_assignment();
@@ -2586,9 +2592,14 @@ private:
         is_keyword("reinterpret_cast")) return parse_keyword_cast();
     if (is_keyword("new") || (is("::") && is_keyword("new", 1))) return parse_new_expression();
     if (is_keyword("delete") || (is("::") && is_keyword("delete", 1))) return parse_delete_expression();
+    (void)peek(3);
+    std::string multiword_type;
+    std::size_t multiword_count = 0;
+    if (IsMultiwordFunctionalTypeAhead(tokens_, pos_, multiword_type, multiword_count)) {
+      for (std::size_t i = 0; i < multiword_count; ++i) take();
+      return postfix_from_base(composite_node(NIdExpression, multiword_type));
+    }
     if (is_builtin_type() && is("(", 1)) {
-      // Fundamental type function-style casts are represented as a type name
-      // call by the PA5 syntax view.
       std::size_t type = take();
       return postfix_from_base(atom_node(NIdExpression, type));
     }
@@ -2909,7 +2920,6 @@ private:
     names_.scopes.pop_back();
     return lambda;
   }
-
   Ast& ast_;
   std::vector<Token>& tokens_;
   PreprocessedTokenCursor& cursor_;
@@ -2925,7 +2935,6 @@ private:
   std::vector<std::string> class_context_names_;
   std::vector<std::size_t> class_scope_indices_;
 };
-
 
 std::string ReadFile(const std::string& path)
 {
@@ -2943,7 +2952,6 @@ std::string ReadFile(const std::string& path)
   }
   return source;
 }
-
 std::pair<std::string, std::string> BuildDateAndTime()
 {
   std::time_t now = std::time(NULL);
@@ -2974,7 +2982,6 @@ Ast ParseTranslationUnit(const std::string& path)
   const std::string source = ReadFile(path);
   return ParseTranslationUnitSource(source, path);
 }
-
 
 void EmitAst(const std::vector<std::string>& inputs, const std::string& output)
 {

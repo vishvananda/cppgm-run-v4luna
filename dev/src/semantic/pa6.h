@@ -125,6 +125,21 @@ public:
   const ScopeRecord& scope(Id id) const;
   const Entity& entity(Id id) const;
   const Binding& binding(Id id) const;
+  Id binding_for_node(Id ast_node) const;
+  Id scope_for_node(Id ast_node) const;
+  Id type_for_node(Id ast_node) const;
+  std::string anonymous_union_storage_name(Id declaration) const;
+  Id add_condition_binding(Id ast_node, Id parent_scope);
+  Id resolve_type_node(Id ast_node, Id scope);
+  Id fundamental_type(const std::string& name);
+  Id qualified_type(Id type, bool is_const, bool is_volatile);
+  Id pointer_type(Id type);
+  Id lvalue_reference_type(Id type);
+  Id rvalue_reference_type(Id type);
+  Id array_type(Id type, long long bound);
+  Id function_type(const Type& type);
+  Id unqualified_type(Id type) const;
+  std::string type_spelling(Id type) const;
   Id lookup(Id scope, const std::string& name,
             bool types_only = false, bool namespaces_only = false) const;
   void print(std::ostream& out) const;

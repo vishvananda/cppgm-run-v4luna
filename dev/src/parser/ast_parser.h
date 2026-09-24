@@ -62,6 +62,7 @@ struct AstNode
   std::size_t source_file_id;
   std::size_t line;
   std::size_t column;
+  std::size_t source_start_token_index;
   std::size_t source_end_token_index;
 };
 
@@ -113,6 +114,9 @@ private:
 // Parse directly from the shared preprocessing pipeline. The returned AST
 // owns all spelling and location metadata required by later compiler stages.
 Ast ParseTranslationUnit(const std::string& path);
+bool IsMultiwordFunctionalTypeAhead(const std::vector<ast_tokens::Token>& tokens,
+                                   std::size_t position, std::string& spelling,
+                                   std::size_t& word_count);
 Ast ParseTranslationUnitSource(const std::string& source,
                                const std::string& path);
 void PrintAst(const Ast& ast, std::ostream& out);

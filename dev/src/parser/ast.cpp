@@ -50,6 +50,7 @@ std::size_t Ast::add(NodeKind kind, std::size_t atom, std::size_t composite)
   node.first_aux_child = node.last_aux_child = node.next_aux_sibling =
       static_cast<std::size_t>(-1);
   node.source_file_id = node.line = node.column = static_cast<std::size_t>(-1);
+  node.source_start_token_index = static_cast<std::size_t>(-1);
   node.source_end_token_index = static_cast<std::size_t>(-1);
   nodes.push_back(node);
   return nodes.size() - 1;

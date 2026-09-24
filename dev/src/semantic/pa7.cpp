@@ -1,4 +1,5 @@
 #include "semantic/pa6.h"
+#include "semantic/pa7_templates.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -87,6 +88,7 @@ public:
   {
     facts_.resize(ast_.nodes.size());
     fact_ready_.assign(ast_.nodes.size(), false);
+    pa7::IndexNamespaceFunctionTemplates(unit_, function_template_index_);
     index_anonymous_types();
   }
 
@@ -113,6 +115,8 @@ public:
       if (defined_functions_.find(entity) != defined_functions_.end()) continue;
       emit_function(definition->second, 1);
     }
+    for (std::size_t i = 0; i < demanded_function_instances_.size(); ++i)
+      emit_function_instance(demanded_function_instances_[i], 1);
     for (std::size_t i = 0; i < translation_unit_constructors_.size(); ++i)
       emit_constructor_definition(translation_unit_constructors_[i], 1);
     out_ = 0;
@@ -142,6 +146,12 @@ private:
   std::unordered_map<Id, Id> member_definition_nodes_;
   std::vector<Id> demanded_member_definitions_;
   std::unordered_set<Id> demanded_member_set_;
+  std::vector<pa6::Binding> instantiated_function_bindings_;
+  std::vector<Id> instantiated_function_origins_;
+  std::vector<Id> demanded_function_instances_;
+  std::unordered_set<Id> demanded_function_instance_set_;
+  std::unordered_map<Id, std::unordered_map<Id, Id> > function_instances_;
+  pa7::FunctionTemplateIndex function_template_index_;
   std::unordered_map<Id, std::string> anonymous_type_names_;
 
   std::string text(Id node) const
@@ -181,6 +191,51 @@ private:
   }
 
   const pa6::Type& type(Id id) const { return unit_.type(id); }
+
+  bool is_instantiated_binding(Id id) const
+  { return id >= unit_.binding_count() &&
+      id - unit_.binding_count() < instantiated_function_bindings_.size(); }
+
+  const pa6::Binding& binding(Id id) const
+  {
+    if (id < unit_.binding_count()) return unit_.binding(id);
+    if (!is_instantiated_binding(id))
+      throw std::logic_error("invalid semantic binding identity");
+    return instantiated_function_bindings_[id - unit_.binding_count()];
+  }
+
+  Id instantiate_template_function(Id primary,
+                                    const std::vector<Id>& explicit_types,
+                                    const std::vector<ExpressionFact>* arguments = 0)
+  {
+    std::vector<Id> argument_types;
+    if (arguments) {
+      for (std::size_t i = 0; i < arguments->size(); ++i)
+        argument_types.push_back((*arguments)[i].type);
+    }
+    Id specialized = pa7::InstantiateFunctionTemplateType(
+        unit_, primary, explicit_types, argument_types, arguments != 0);
+    if (specialized == none) return none;
+    specialized = canonical_function(specialized);
+    std::unordered_map<Id, Id>& instances = function_instances_[primary];
+    const std::unordered_map<Id, Id>::const_iterator cached = instances.find(specialized);
+    if (cached != instances.end()) return cached->second;
+    pa6::Binding instance = unit_.binding(primary);
+    instance.type = specialized;
+    instance.output = false;
+    instance.previous_same_name = none;
+    const Id id = unit_.binding_count() + instantiated_function_bindings_.size();
+    instantiated_function_bindings_.push_back(instance);
+    instantiated_function_origins_.push_back(primary);
+    instances[specialized] = id;
+    return id;
+  }
+
+  void demand_function_instance(Id id)
+  {
+    if (is_instantiated_binding(id) && demanded_function_instance_set_.insert(id).second)
+      demanded_function_instances_.push_back(id);
+  }
 
   void index_anonymous_types()
   {
@@ -484,12 +539,13 @@ private:
 
   std::string binding_name(Id id) const
   {
-    if (id == none || id >= unit_.binding_count()) return "<unknown>";
-    const pa6::Binding& binding = unit_.binding(id);
-    Id scope = binding.scope;
-    if (binding.entity != none && binding.entity < unit_.entity_count())
-      scope = unit_.entity(binding.entity).scope;
-    return qualified_name(scope, binding.name);
+    if (id == none || (id >= unit_.binding_count() && !is_instantiated_binding(id)))
+      return "<unknown>";
+    const pa6::Binding& selected = binding(id);
+    Id scope = selected.scope;
+    if (selected.entity != none && selected.entity < unit_.entity_count())
+      scope = unit_.entity(selected.entity).scope;
+    return qualified_name(scope, selected.name);
   }
 
   std::vector<std::string> split_name(const std::string& spelling,
@@ -516,9 +572,9 @@ private:
   void add_unique(std::vector<Id>& result, Id binding) const
   {
     if (binding == none) return;
-    const pa6::Binding& candidate = unit_.binding(binding);
+    const pa6::Binding& candidate = this->binding(binding);
     for (std::size_t i = 0; i < result.size(); ++i) {
-      const pa6::Binding& old = unit_.binding(result[i]);
+      const pa6::Binding& old = this->binding(result[i]);
       if (result[i] == binding ||
           (old.kind == pa6::FunctionBinding && candidate.kind == pa6::FunctionBinding &&
            old.entity == candidate.entity)) return;
@@ -544,6 +600,18 @@ private:
       if (types_only && !ty) continue;
       if (!namespaces_only && !types_only && ns) continue;
       add_unique(result, id);
+    }
+    if (!namespaces_only && !types_only && record.kind == pa6::NamespaceScope) {
+      const pa7::FunctionTemplateIndex::const_iterator indexed_scope =
+          function_template_index_.find(scope);
+      if (indexed_scope != function_template_index_.end()) {
+        const Id name_identity = ast_.find_name(name);
+        const std::unordered_map<Id, std::vector<Id> >::const_iterator functions =
+            indexed_scope->second.find(name_identity);
+        if (functions != indexed_scope->second.end())
+          for (std::size_t i = 0; i < functions->second.size(); ++i)
+            add_unique(result, functions->second[i]);
+      }
     }
     return result;
   }
@@ -782,7 +850,16 @@ private:
   }
 
   bool is_function_binding(Id id) const
-  { return id != none && unit_.binding(id).kind == pa6::FunctionBinding; }
+  { return id != none && binding(id).kind == pa6::FunctionBinding; }
+
+  bool is_primary_function_template(Id id) const
+  {
+    if (id == none || id >= unit_.binding_count() ||
+        unit_.binding(id).kind != pa6::FunctionBinding) return false;
+    const Id scope = unit_.binding(id).scope;
+    return scope < unit_.scope_count() &&
+        unit_.scope(scope).kind == pa6::TemplateScope;
+  }
 
   int unqualified_rank(Id id) const
   {
@@ -946,23 +1023,24 @@ private:
     Id selected = none;
     for (std::size_t i = 0; i < source.overloads.size(); ++i) {
       const Id candidate = source.overloads[i];
-      const Id candidate_type = canonical_function(unit_.binding(candidate).type);
+      const Id candidate_type = canonical_function(binding(candidate).type);
       if (!same_function_type(candidate_type, target_function)) continue;
-      const pa6::Binding& binding = unit_.binding(candidate);
-      const pa6::ScopeRecord& owner = unit_.scope(binding.scope);
+      const pa6::Binding& candidate_binding = binding(candidate);
+      const pa6::ScopeRecord& owner = unit_.scope(candidate_binding.scope);
       if (member_target) {
         if (owner.kind != pa6::ClassScope || owner.entity != target_class) continue;
       } else if (owner.kind == pa6::ClassScope) continue;
       if (selected != none) return none;
       selected = candidate;
     }
+    demand_function_instance(selected);
     return selected;
   }
 
   Id function_address_type(Id binding)
   {
-    const Id function = canonical_function(unit_.binding(binding).type);
-    const pa6::ScopeRecord& owner = unit_.scope(unit_.binding(binding).scope);
+    const Id function = canonical_function(this->binding(binding).type);
+    const pa6::ScopeRecord& owner = unit_.scope(this->binding(binding).scope);
     if (owner.kind == pa6::ClassScope)
       return unit_.member_pointer_type(owner.entity, function);
     return unit_.pointer_type(function);
@@ -1078,6 +1156,15 @@ private:
     return strictly;
   }
 
+  bool same_conversion_vectors(const std::vector<Conversion>& a,
+                               const std::vector<Conversion>& b) const
+  {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i)
+      if (!same_conversion(a[i], b[i])) return false;
+    return true;
+  }
+
   Id select_overload(const std::vector<Id>& candidates,
                      const std::vector<Id>& arguments,
                      const std::vector<ExpressionFact>& argument_facts,
@@ -1090,9 +1177,14 @@ private:
     };
     std::vector<Viable> viable;
     for (std::size_t ci = 0; ci < candidates.size(); ++ci) {
-      const Id candidate = candidates[ci];
+      Id candidate = candidates[ci];
       if (!is_function_binding(candidate)) continue;
-      const Id fn = canonical_function(unit_.binding(candidate).type);
+      if (is_primary_function_template(candidate)) {
+        candidate = instantiate_template_function(candidate, std::vector<Id>(),
+                                                   &argument_facts);
+        if (candidate == none) continue;
+      }
+      const Id fn = canonical_function(binding(candidate).type);
       if (!is_function(fn)) continue;
       const pa6::Type& signature = type(fn);
       const std::size_t fixed = signature.parameters.size();
@@ -1118,7 +1210,14 @@ private:
     for (std::size_t i = 0; i < viable.size(); ++i) {
       bool dominated = false;
       for (std::size_t j = 0; j < viable.size(); ++j) {
-        if (i != j && candidate_better(viable[j].conversions, viable[i].conversions)) {
+        if (i == j) continue;
+        bool better = candidate_better(viable[j].conversions, viable[i].conversions);
+        if (!better && same_conversion_vectors(viable[i].conversions,
+                                               viable[j].conversions) &&
+            !is_instantiated_binding(viable[j].binding) &&
+            is_instantiated_binding(viable[i].binding))
+          better = true;
+        if (better) {
           dominated = true; break;
         }
       }
@@ -1127,6 +1226,7 @@ private:
     if (best.size() != 1) throw std::runtime_error("ambiguous function overload");
     const Viable& result = viable[best[0]];
     if (selected_targets) *selected_targets = result.targets;
+    demand_function_instance(result.binding);
     return result.binding;
   }
 
@@ -1228,7 +1328,7 @@ private:
           result.type = function_address_type(selected);
           result.category = PRValue;
         } else {
-          result.type = canonical_function(unit_.binding(selected).type);
+          result.type = canonical_function(binding(selected).type);
           result.category = LValue;
         }
         result.overloads.clear();
@@ -1258,13 +1358,27 @@ private:
         if (is_function_binding(found[i])) add_unique(functions, found[i]);
         else if (first_non_function == none) first_non_function = found[i];
       }
+      std::vector<Id> explicit_template_types;
+      const bool explicit_template_id = pa7::ExplicitFunctionTemplateTypes(
+          unit_, ast_, current_scope_, node, explicit_template_types);
+      if (explicit_template_id) {
+        std::vector<Id> instances;
+        for (std::size_t i = 0; i < functions.size(); ++i) {
+          if (!is_primary_function_template(functions[i])) continue;
+          const Id instance = instantiate_template_function(functions[i],
+                                                             explicit_template_types);
+          if (instance != none) add_unique(instances, instance);
+        }
+        functions.swap(instances);
+        first_non_function = none;
+      }
       if (!functions.empty() && first_non_function == none) {
         result.overloads = functions;
         if (functions.size() == 1 || expected != none) {
           const Id selected = expected == none ? functions[0] : resolve_function_overload(result, expected);
           if (selected == none) throw std::runtime_error("ambiguous overloaded function name");
           result.binding = selected;
-          result.type = canonical_function(unit_.binding(selected).type);
+          result.type = canonical_function(binding(selected).type);
           result.category = LValue;
           result.overloads.clear();
           result.overloads.push_back(selected);
@@ -1272,7 +1386,7 @@ private:
       } else {
         const Id binding = first_non_function != none ? first_non_function : functions[0];
         result.binding = binding;
-        const pa6::Binding& b = unit_.binding(binding);
+        const pa6::Binding& b = this->binding(binding);
         if (b.kind == pa6::EnumeratorBinding) {
           result.type = canonical_type(b.type);
           result.category = PRValue;
@@ -1324,7 +1438,7 @@ private:
         result.type = function_address_type(selected);
         result.category = PRValue;
       } else {
-        result.type = canonical_function(unit_.binding(selected).type);
+        result.type = canonical_function(binding(selected).type);
         result.category = LValue;
       }
       result.overloads.clear();
@@ -1360,12 +1474,12 @@ private:
       if (operand.category == PRValue || operand.type == none)
         throw std::runtime_error("address-of requires an lvalue or function");
       if (operand.binding != none &&
-          unit_.scope(unit_.binding(operand.binding).scope).kind == pa6::ClassScope)
+          unit_.scope(binding(operand.binding).scope).kind == pa6::ClassScope)
         result.type = unit_.member_pointer_type(
-            unit_.scope(unit_.binding(operand.binding).scope).entity, operand.type);
+            unit_.scope(binding(operand.binding).scope).entity, operand.type);
       else result.type = unit_.pointer_type(operand.type);
       if (operand.binding != none &&
-          unit_.binding(operand.binding).kind == pa6::FunctionBinding)
+          binding(operand.binding).kind == pa6::FunctionBinding)
         result.binding = operand.binding;
       result.category = PRValue;
     } else if (op == "*") {
@@ -1905,7 +2019,7 @@ private:
       std::vector<Id> targets;
       function = select_overload(callee.overloads, args, argument_facts, &targets);
       call.selected = function;
-      call.function_type = canonical_function(unit_.binding(function).type);
+      call.function_type = canonical_function(binding(function).type);
       call.argument_types = targets;
     } else {
       function = canonical_function(function_type_from(callee.type));
@@ -2003,10 +2117,10 @@ private:
         const Id selected = resolve_function_overload(fact, expected);
         if (selected == none) throw std::runtime_error("no target-compatible function overload");
         fact.binding = selected;
-        fact.type = canonical_function(unit_.binding(selected).type);
+        fact.type = canonical_function(binding(selected).type);
       }
-      if (fact.binding != none && unit_.binding(fact.binding).kind == pa6::EnumeratorBinding) {
-        const pa6::Binding& b = unit_.binding(fact.binding);
+      if (fact.binding != none && binding(fact.binding).kind == pa6::EnumeratorBinding) {
+        const pa6::Binding& b = binding(fact.binding);
         header << "literal prvalue " << type_spelling(b.type) << ' ' << b.value;
       } else {
         std::unordered_map<Id, std::pair<Id, std::string> >::const_iterator injected =
@@ -2021,8 +2135,8 @@ private:
         const std::string name = node_name(node);
         Id displayed_type = fact.type;
         if (fact.binding != none &&
-            unit_.binding(fact.binding).kind == pa6::FunctionBinding &&
-            unit_.scope(unit_.binding(fact.binding).scope).kind == pa6::ClassScope)
+            binding(fact.binding).kind == pa6::FunctionBinding &&
+            unit_.scope(binding(fact.binding).scope).kind == pa6::ClassScope)
           displayed_type = function_dump_type(fact.binding);
         header << "id-expression " << category_name(fact.category) << ' '
                << type_spelling(displayed_type) << ' ' << name;
@@ -2129,9 +2243,7 @@ private:
       const Id target_value = strip_cv(target);
       if (kids.size() > 1 && ast_.nodes[kids[1]].kind == NUnaryExpression &&
           text(kids[1]) == "&" &&
-          (type(target_value).kind == pa6::MemberPointerType ||
-           (type(target_value).kind == pa6::PointerType &&
-            is_function(type(target_value).base)))) {
+          type(target_value).kind == pa6::MemberPointerType) {
         emit_expression(kids[1], depth, target);
         return;
       }
@@ -2373,6 +2485,59 @@ private:
          type_spelling(constructor.function_type));
     line(depth + 1, "parameter this " + type_spelling(constructor.pointer_type));
     line(depth + 1, "compound-statement");
+  }
+
+  Id template_function_declarator(Id primary) const
+  {
+    for (Id node = 0; node < ast_.nodes.size(); ++node) {
+      if (ast_.nodes[node].kind != NTemplateDeclaration) continue;
+      const Id declaration = ast_.nodes[node].first_child == none ? none
+          : ast_.nodes[ast_.nodes[node].first_child].next_sibling;
+      if (declaration == none) continue;
+      if (ast_.nodes[declaration].kind == NFunctionDefinition) {
+        if (unit_.binding_for_node(declaration) == primary) {
+          const Id seq = ast_.nodes[declaration].first_child;
+          return seq == none ? none : ast_.nodes[seq].next_sibling;
+        }
+      } else if (ast_.nodes[declaration].kind == NSimpleDeclaration) {
+        const Id seq = ast_.nodes[declaration].first_child;
+        const Id list = seq == none ? none : ast_.nodes[seq].next_sibling;
+        for (Id item = list == none ? none : ast_.nodes[list].first_child;
+             item != none; item = ast_.nodes[item].next_sibling)
+          if (unit_.binding_for_node(item) == primary)
+            return ast_.nodes[item].first_child;
+      }
+    }
+    return none;
+  }
+
+  void emit_function_instance(Id id, unsigned depth)
+  {
+    const pa6::Binding& function = binding(id);
+    const Id signature_id = canonical_function(function.type);
+    if (!is_function(signature_id))
+      throw std::logic_error("function template instance has a non-function type");
+    const pa6::Type& signature = type(signature_id);
+    line(depth, "function-declaration " + binding_name(id) + " " +
+         type_spelling(signature_id));
+    std::vector<std::string> parameter_names;
+    const std::size_t instance_index = id - unit_.binding_count();
+    const Id declarator = template_function_declarator(
+        instantiated_function_origins_[instance_index]);
+    const Id clause = first_parameter_clause(declarator);
+    for (Id parameter = clause == none ? none : ast_.nodes[clause].first_child;
+         parameter != none; parameter = ast_.nodes[parameter].next_sibling) {
+      if (ast_.nodes[parameter].kind != NParameterDeclaration) continue;
+      const Id sequence = ast_.nodes[parameter].first_child;
+      const Id parameter_declarator = sequence == none ? none
+          : ast_.nodes[sequence].next_sibling;
+      parameter_names.push_back(declarator_name(parameter_declarator));
+    }
+    for (std::size_t i = 0; i < signature.parameters.size(); ++i) {
+      const std::string name = i < parameter_names.size() ? parameter_names[i] : "";
+      line(depth + 1, "parameter " + name + " " +
+           type_spelling(signature.parameters[i]));
+    }
   }
 
   void demand_member_definition(Id binding)

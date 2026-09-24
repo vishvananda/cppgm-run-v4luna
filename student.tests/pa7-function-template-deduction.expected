@@ -1,0 +1,19 @@
+1 translation units
+start translation unit 1
+translation-unit
+  function-declaration select function of (int) returning void
+  function-definition use_identity function of () returning int
+    compound-statement
+      return-statement
+        call-expression prvalue int
+          callee identity function of (int) returning int
+          literal prvalue int 4
+  function-definition use_nontemplate function of () returning void
+    compound-statement
+      expression-statement
+        call-expression prvalue void
+          callee select function of (int) returning void
+          literal prvalue int 3
+  function-declaration identity function of (int) returning int
+    parameter value int
+end translation unit

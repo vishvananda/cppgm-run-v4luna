@@ -1,99 +1,101 @@
 // (C) 2013 CPPGM Foundation www.cppgm.org.  All rights reserved.
 
-#include <utility>
 #include <sys/stat.h>
-#include <iostream>
-#include <string>
-#include <vector>
-#include <stdexcept>
+
+#include <cstdlib>
+#include <ctime>
 #include <fstream>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "postprocess/posttoken.h"
+#include "preprocess/preprocessor.h"
 
 using namespace std;
 
-#include "support/not_implemented.h"
-
-// Supplied host helper for pragma-once identity; no syscall implementation
-// is required in this assignment.
 typedef pair<unsigned long long, unsigned long long> PreprocessorFileId;
 
 bool GetPreprocessorFileId(const string& path, PreprocessorFileId& fileid)
 {
-    struct stat info;
-    if (stat(path.c_str(), &info) != 0)
-        return false;
-    fileid = make_pair(static_cast<unsigned long long>(info.st_dev),
-                      static_cast<unsigned long long>(info.st_ino));
-    return true;
+	struct stat info;
+	if (stat(path.c_str(), &info) != 0) return false;
+	fileid = make_pair(static_cast<unsigned long long>(info.st_dev),
+		static_cast<unsigned long long>(info.st_ino));
+	return true;
 }
 
-bool HasBatchStdinArg(int argc, char** argv)
+namespace
 {
-	for (int i = 1; i < argc; i++)
+
+string ReadFile(const string& path)
+{
+	ifstream input(path.c_str(), ios::binary);
+	if (!input) throw runtime_error("unable to open source file: " + path);
+	string contents;
+	char buffer[64 * 1024];
+	for (;;)
 	{
-		if (string(argv[i]) == "--batch-stdin")
-			return true;
+		input.read(buffer, sizeof(buffer));
+		const streamsize count = input.gcount();
+		if (count > 0) contents.append(buffer, static_cast<size_t>(count));
+		if (input.bad()) throw runtime_error("failed to read source file: " + path);
+		if (input.eof()) break;
+		if (!input) throw runtime_error("failed to read source file: " + path);
 	}
-	return false;
+	return contents;
 }
 
-int RunNotImplementedBatchMode()
+pair<string, string> BuildDateAndTime()
 {
-	string line;
-	while (getline(cin, line))
-	{
-		(void)line;
-		cout << "EXIT_NOT_IMPLEMENTED" << endl;
-	}
-	return EXIT_SUCCESS;
+	const time_t now = time(NULL);
+	const tm* local = localtime(&now);
+	if (!local) throw runtime_error("unable to read build date and time");
+	const char* text = asctime(local);
+	if (!text || string(text).size() < 25)
+		throw runtime_error("unable to format build date and time");
+	return make_pair(string(text + 4, 6) + " " + string(text + 20, 4),
+		string(text + 11, 8));
 }
+
+} // namespace
 
 int main(int argc, char** argv)
 {
 	try
 	{
-		if (HasBatchStdinArg(argc, argv))
-			return RunNotImplementedBatchMode();
+		if (argc < 4 || string(argv[1]) != "-o")
+			throw runtime_error("usage: preproc -o <outfile> <source> [<source> ...]");
+		const string outfile = argv[2];
+		const size_t source_count = static_cast<size_t>(argc - 3);
+		for (int i = 3; i < argc; ++i)
+			if (!string(argv[i]).empty() && argv[i][0] == '-')
+				throw runtime_error("unsupported preprocessor option");
 
-		vector<string> args;
-
-		for (int i = 1; i < argc; i++)
-			args.emplace_back(argv[i]);
-
-		if (args.size() < 3 || args[0] != "-o")
-			throw logic_error("invalid usage");
-
-		string outfile = args[1];
-		size_t nsrcfiles = args.size() - 2;
-
-		throw NotImplementedException();
-
-		ofstream out(outfile);
-
-		out << "preproc " << nsrcfiles << endl;
-
-		for (size_t i = 0; i < nsrcfiles; i++)
+		ofstream output_file(outfile.c_str(), ios::out | ios::trunc);
+		if (!output_file) throw runtime_error("unable to open output file: " + outfile);
+		const pair<string, string> build = BuildDateAndTime();
+		output_file << "preproc " << source_count << '\n';
+		for (int i = 3; i < argc; ++i)
 		{
-			string srcfile = args[i+2];
-
-			out << "sof " << srcfile << endl;
-
-			ifstream in(srcfile);
-
-			// TODO: implement `preproc` as described in the complete preprocessor assignment
-			out << "not yet implemented" << endl;
-	
-			out << "eof" << endl;
-
+			const string path = argv[i];
+			const string source = ReadFile(path);
+			PreprocessedTranslationUnit translation_unit;
+			PreprocessTranslationUnit(source, path, translation_unit,
+				build.first, build.second);
+			output_file << "sof " << path << '\n';
+			if (!PostTokenizePreprocessingTokens(translation_unit.tokens,
+				output_file, true))
+				return EXIT_FAILURE;
+			if (!output_file) throw runtime_error("failed to write preprocessor output");
 		}
+		return EXIT_SUCCESS;
 	}
-	catch (const NotImplementedException& e)
+	catch (const exception& error)
 	{
-		cerr << "ERROR: " << e.what() << endl;
-		return CPPGM_EXIT_NOT_IMPLEMENTED;
-	}
-	catch (exception& e)
-	{
-		cerr << "ERROR: " << e.what() << endl;
+		cerr << "ERROR: " << error.what() << endl;
 		return EXIT_FAILURE;
 	}
 }

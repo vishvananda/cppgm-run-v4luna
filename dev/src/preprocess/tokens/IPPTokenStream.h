@@ -16,6 +16,9 @@ struct IPPTokenStream
 		{ set_source_line(line); (void)column; }
 	virtual void emit_whitespace_sequence() = 0;
 	virtual void emit_new_line() = 0;
+	// A newline inside a block comment is still visible to location tracking,
+	// while preprocessing clients may treat the comment as a whitespace run.
+	virtual bool emit_comment_new_line() { emit_new_line(); return false; }
 	virtual void emit_header_name(const std::string& data) = 0;
 	virtual void emit_identifier(const std::string& data) = 0;
 	virtual void emit_pp_number(const std::string& data) = 0;

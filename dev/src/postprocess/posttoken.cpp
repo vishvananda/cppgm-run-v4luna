@@ -554,65 +554,71 @@ string HexDump(const void* pdata, size_t nbytes)
 // DebugPostTokenOutputStream: helper class to produce PA2 output format
 struct DebugPostTokenOutputStream
 {
+	explicit DebugPostTokenOutputStream(ostream& output)
+		: output(output), valid(true) {}
+	ostream& output;
+	bool valid;
+
 	// output: invalid <source>
 	void emit_invalid(const string& source)
 	{
-		cout << "invalid " << source << '\n';
+		valid = false;
+		output << "invalid " << source << '\n';
 	}
 
 	// output: simple <source> <token_type>
 	void emit_simple(const string& source, ETokenType token_type)
 	{
-		cout << "simple " << source << " " << TokenTypeToStringMap.at(token_type) << '\n';
+		output << "simple " << source << " " << TokenTypeToStringMap.at(token_type) << '\n';
 	}
 
 	// output: identifier <source>
 	void emit_identifier(const string& source)
 	{
-		cout << "identifier " << source << '\n';
+		output << "identifier " << source << '\n';
 	}
 
 	// output: literal <source> <type> <hexdump(data,nbytes)>
 	void emit_literal(const string& source, EFundamentalType type, const void* data, size_t nbytes)
 	{
-		cout << "literal " << source << " " << FundamentalTypeToStringMap.at(type) << " " << HexDump(data, nbytes) << '\n';
+		output << "literal " << source << " " << FundamentalTypeToStringMap.at(type) << " " << HexDump(data, nbytes) << '\n';
 	}
 
 	// output: literal <source> array of <num_elements> <type> <hexdump(data,nbytes)>
 	void emit_literal_array(const string& source, size_t num_elements, EFundamentalType type, const void* data, size_t nbytes)
 	{
-		cout << "literal " << source << " array of " << num_elements << " " << FundamentalTypeToStringMap.at(type) << " " << HexDump(data, nbytes) << '\n';
+		output << "literal " << source << " array of " << num_elements << " " << FundamentalTypeToStringMap.at(type) << " " << HexDump(data, nbytes) << '\n';
 	}
 
 	// output: user-defined-literal <source> <ud_suffix> character <type> <hexdump(data,nbytes)>
 	void emit_user_defined_literal_character(const string& source, const string& ud_suffix, EFundamentalType type, const void* data, size_t nbytes)
 	{
-		cout << "user-defined-literal " << source << " " << ud_suffix << " character " << FundamentalTypeToStringMap.at(type) << " " << HexDump(data, nbytes) << '\n';
+		output << "user-defined-literal " << source << " " << ud_suffix << " character " << FundamentalTypeToStringMap.at(type) << " " << HexDump(data, nbytes) << '\n';
 	}
 
 	// output: user-defined-literal <source> <ud_suffix> string array of <num_elements> <type> <hexdump(data, nbytes)>
 	void emit_user_defined_literal_string_array(const string& source, const string& ud_suffix, size_t num_elements, EFundamentalType type, const void* data, size_t nbytes)
 	{
-		cout << "user-defined-literal " << source << " " << ud_suffix << " string array of " << num_elements << " " << FundamentalTypeToStringMap.at(type) << " " << HexDump(data, nbytes) << '\n';
+		output << "user-defined-literal " << source << " " << ud_suffix << " string array of " << num_elements << " " << FundamentalTypeToStringMap.at(type) << " " << HexDump(data, nbytes) << '\n';
 	}
 
 	// output: user-defined-literal <source> <ud_suffix> <prefix>
 	void emit_user_defined_literal_integer(const string& source, const string& ud_suffix, const string& prefix)
 	{
-		cout << "user-defined-literal " << source << " " << ud_suffix << " integer " << prefix << '\n';
+		output << "user-defined-literal " << source << " " << ud_suffix << " integer " << prefix << '\n';
 	}
 
 	// output: user-defined-literal <source> <ud_suffix> <prefix>
 	void emit_user_defined_literal_floating(const string& source, const string& ud_suffix, const string& prefix)
 	{
-		cout << "user-defined-literal " << source << " " << ud_suffix << " floating " << prefix << '\n';
+		output << "user-defined-literal " << source << " " << ud_suffix << " floating " << prefix << '\n';
 	}
 
 	// output : eof
 	void emit_eof()
 	{
-		cout << "eof\n";
-		cout.flush();
+		output << "eof\n";
+		output.flush();
 	}
 };
 
@@ -1245,7 +1251,8 @@ bool AppendStringAtom(vector<unsigned char>& bytes, const DecodedAtom& atom,
 class PostTokenConsumer : public IPPTokenStream
 {
 public:
-	PostTokenConsumer() : output_(), operator_literal_pending_(false) {}
+	explicit PostTokenConsumer(ostream& output)
+		: output_(output), operator_literal_pending_(false) {}
 
 	void emit_whitespace_sequence() {}
 	void emit_new_line() {}
@@ -1380,6 +1387,8 @@ public:
 		output_.emit_eof();
 	}
 
+	bool isValid() const { return output_.valid; }
+
 private:
 	DebugPostTokenOutputStream output_;
 	vector<StringPart> string_run_;
@@ -1469,8 +1478,63 @@ private:
 
 void PostTokenizeSource(const string& source)
 {
-	PostTokenConsumer output;
+	PostTokenConsumer output(cout);
 	TokenizePreprocessingSource(source, output);
+}
+
+bool PostTokenizePreprocessingTokens(
+	const vector<PreprocessingToken>& tokens, ostream& output, bool emit_eof)
+{
+	PostTokenConsumer consumer(output);
+	for (size_t i = 0; i < tokens.size(); ++i)
+	{
+		const PreprocessingToken& token = tokens[i];
+		switch (token.kind)
+		{
+		case PP_TOKEN_WHITESPACE:
+			consumer.emit_whitespace_sequence();
+			break;
+		case PP_TOKEN_NEWLINE:
+			consumer.emit_new_line();
+			break;
+		case PP_TOKEN_HEADER_NAME:
+			consumer.emit_header_name(token.spelling);
+			break;
+		case PP_TOKEN_IDENTIFIER:
+			consumer.emit_identifier(token.spelling);
+			break;
+		case PP_TOKEN_NUMBER:
+			consumer.emit_pp_number(token.spelling);
+			break;
+		case PP_TOKEN_CHARACTER:
+			consumer.emit_character_literal(token.spelling,
+				token.ucn_backslash_offsets);
+			break;
+		case PP_TOKEN_USER_CHARACTER:
+			consumer.emit_user_defined_character_literal(token.spelling,
+				token.ucn_backslash_offsets);
+			break;
+		case PP_TOKEN_STRING:
+			consumer.emit_string_literal(token.spelling,
+				token.ucn_backslash_offsets);
+			break;
+		case PP_TOKEN_USER_STRING:
+			consumer.emit_user_defined_string_literal(token.spelling,
+				token.ucn_backslash_offsets);
+			break;
+		case PP_TOKEN_PUNCTUATOR:
+			consumer.emit_preprocessing_op_or_punc(token.spelling);
+			break;
+		case PP_TOKEN_OTHER:
+			consumer.emit_non_whitespace_char(token.spelling);
+			break;
+		case PP_TOKEN_EOF:
+			break;
+		}
+	}
+	if (emit_eof)
+		consumer.emit_eof();
+	return consumer.isValid();
 }
 
 namespace

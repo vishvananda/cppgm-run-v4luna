@@ -664,8 +664,10 @@ private:
 			if (point.value == '\n')
 			{
 				if (has_whitespace) emitWhitespace(whitespace_start);
-				emitNewLine(cursor_.consume());
-				has_whitespace = false;
+				const CodePoint newline = cursor_.consume();
+				setLocation(newline);
+				has_whitespace = output_.emit_comment_new_line();
+				directive_state_ = AtDirectiveStart;
 				whitespace_start = cursor_.peek();
 				continue;
 			}

@@ -9,6 +9,8 @@
 #include <ctime>
 #include <deque>
 #include <fstream>
+#include <functional>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <set>
@@ -35,7 +37,8 @@ bool IsWhitespace(const PreprocessingToken& token)
 
 bool IsIdentifier(const PreprocessingToken& token, const std::string& spelling)
 {
-	return token.kind == PP_TOKEN_IDENTIFIER && token.spelling == spelling;
+	return token.kind == PP_TOKEN_IDENTIFIER && token.identifier_spelling &&
+		*token.identifier_spelling == spelling;
 }
 
 bool IsPunctuator(const PreprocessingToken& token, const std::string& spelling)
@@ -43,10 +46,69 @@ bool IsPunctuator(const PreprocessingToken& token, const std::string& spelling)
 	return token.kind == PP_TOKEN_PUNCTUATOR && token.spelling == spelling;
 }
 
+const std::string& Spelling(const PreprocessingToken& token)
+{
+	return token.kind == PP_TOKEN_IDENTIFIER && token.identifier_spelling
+		? *token.identifier_spelling : token.spelling;
+}
+
+struct IdentifierTable
+{
+	IdentifierTable(std::deque<std::string>& names,
+		std::vector<std::size_t>& slots) : names(names), slots(slots) {}
+	std::deque<std::string>& names;
+	std::vector<std::size_t>& slots;
+
+	void clear()
+	{
+		names.clear();
+		slots.assign(16, 0);
+	}
+
+	std::size_t intern(const std::string& spelling)
+	{
+		if (slots.empty()) slots.assign(16, 0);
+		std::size_t slot = findSlot(spelling);
+		if (slots[slot] != 0) return slots[slot] - 1;
+		if ((names.size() + 1) * 10 >= slots.size() * 7)
+		{
+			rehash(slots.size() * 2);
+			slot = findSlot(spelling);
+		}
+		names.push_back(spelling);
+		const std::size_t id = names.size() - 1;
+		slots[slot] = id + 1;
+		return id;
+	}
+
+	std::size_t findSlot(const std::string& spelling) const
+	{
+		const std::size_t mask = slots.size() - 1;
+		std::size_t slot = std::hash<std::string>()(spelling) & mask;
+		while (slots[slot] != 0 && names[slots[slot] - 1] != spelling)
+			slot = (slot + 1) & mask;
+		return slot;
+	}
+
+	void rehash(std::size_t capacity)
+	{
+		slots.assign(capacity, 0);
+		for (std::size_t id = 0; id < names.size(); ++id)
+		{
+			const std::size_t mask = slots.size() - 1;
+			std::size_t slot = std::hash<std::string>()(names[id]) & mask;
+			while (slots[slot] != 0) slot = (slot + 1) & mask;
+			slots[slot] = id + 1;
+		}
+	}
+};
+
 struct TokenCollector : IPPTokenStream
 {
-	TokenCollector() : line_(1), column_(1), has_space_(false) {}
+	explicit TokenCollector(IdentifierTable& identifiers)
+		: identifiers_(identifiers), line_(1), column_(1), has_space_(false) {}
 	std::vector<PreprocessingToken> tokens;
+	IdentifierTable& identifiers_;
 	std::size_t line_;
 	std::size_t column_;
 	bool has_space_;
@@ -122,7 +184,13 @@ private:
 	{
 		PreprocessingToken token;
 		token.kind = kind;
-		token.spelling = spelling;
+		if (kind == PP_TOKEN_IDENTIFIER)
+		{
+			token.identifier_id = identifiers_.intern(spelling);
+			token.identifier_spelling = &identifiers_.names[token.identifier_id];
+		}
+		else
+			token.spelling = spelling;
 		token.line = line_;
 		token.column = column_;
 		token.leading_space = has_space_;
@@ -132,9 +200,10 @@ private:
 	}
 };
 
-std::vector<PreprocessingToken> Tokenize(const std::string& source)
+std::vector<PreprocessingToken> Tokenize(const std::string& source,
+	IdentifierTable& identifiers)
 {
-	TokenCollector collector;
+	TokenCollector collector(identifiers);
 	TokenizePreprocessingSource(source, collector);
 	return collector.tokens;
 }
@@ -155,20 +224,20 @@ std::vector<PreprocessingToken> NonWhitespace(
 	return result;
 }
 
-bool ContainsName(const std::vector<std::string>& names, const std::string& name)
+bool ContainsName(const std::vector<std::size_t>& names, std::size_t name)
 {
 	return std::find(names.begin(), names.end(), name) != names.end();
 }
 
-void AddName(std::vector<std::string>& names, const std::string& name)
+void AddName(std::vector<std::size_t>& names, std::size_t name)
 {
 	if (!ContainsName(names, name)) names.push_back(name);
 }
 
-std::vector<std::string> UnionNames(const std::vector<std::string>& a,
-	const std::vector<std::string>& b)
+std::vector<std::size_t> UnionNames(const std::vector<std::size_t>& a,
+	const std::vector<std::size_t>& b)
 {
-	std::vector<std::string> result = a;
+	std::vector<std::size_t> result = a;
 	for (std::size_t i = 0; i < b.size(); ++i) AddName(result, b[i]);
 	return result;
 }
@@ -334,11 +403,46 @@ struct Macro
 	bool variadic;
 	BuiltinKind builtin;
 	std::size_t id;
-	std::vector<std::string> parameters;
+	std::vector<std::size_t> parameters;
 	std::vector<PreprocessingToken> replacement;
 
 	Macro() : function_like(false), variadic(false), builtin(BUILTIN_NONE),
 		id(std::numeric_limits<std::size_t>::max()) {}
+};
+
+struct DeferredExpansion
+{
+	bool active;
+	bool saw_open;
+	std::size_t scan_index;
+	int depth;
+
+	DeferredExpansion() : active(false), saw_open(false), scan_index(0), depth(0) {}
+};
+
+enum DeferredScanResult
+{
+	DEFERRED_WAIT,
+	DEFERRED_NOT_CALL,
+	DEFERRED_COMPLETE
+};
+
+enum PragmaScanPhase
+{
+	PRAGMA_EXPECT_OPEN,
+	PRAGMA_EXPECT_STRING,
+	PRAGMA_EXPECT_CLOSE
+};
+
+struct DeferredPragma
+{
+	bool active;
+	PragmaScanPhase phase;
+	std::size_t scan_index;
+	std::size_t literal_index;
+
+	DeferredPragma()
+		: active(false), phase(PRAGMA_EXPECT_OPEN), scan_index(0), literal_index(0) {}
 };
 
 class Preprocessor
@@ -355,44 +459,47 @@ public:
 		token.kind = PP_TOKEN_NUMBER;
 		token.spelling = value;
 		macro.replacement.push_back(token);
-		macros_[name] = macro;
+		macros_[macro.id] = macro;
 	}
 
 	void initialize()
 	{
-		macro_ids_.clear();
-		macro_names_.clear();
+		identifiers_->clear();
+		macros_.clear();
+		variadic_parameter_id_ = ensureMacroId("__VA_ARGS__");
 		nested_context_nodes_.clear();
 		nested_context_nodes_.push_back(NestedContextNode());
-		nested_contexts_.clear();
-		nested_contexts_.push_back(0);
+		nested_context_slots_.assign(16, 0);
 		addBuiltinObject("__CPPGM__", "201303L");
 		addBuiltinObject("__cplusplus", "201103L");
 		addBuiltinObject("__STDC_HOSTED__", "1");
 		addBuiltinObject("__CPPGM_AUTHOR__", "\"Codex\"");
-		for (std::unordered_map<std::string, Macro>::iterator i = macros_.begin();
+		for (std::unordered_map<std::size_t, Macro>::iterator i = macros_.begin();
 			i != macros_.end(); ++i)
 			if (i->second.replacement[0].spelling[0] == '"')
 				i->second.replacement[0].kind = PP_TOKEN_STRING;
-		Macro file; file.builtin = BUILTIN_FILE; file.id = ensureMacroId("__FILE__"); macros_["__FILE__"] = file;
-		Macro line; line.builtin = BUILTIN_LINE; line.id = ensureMacroId("__LINE__"); macros_["__LINE__"] = line;
-		Macro date; date.builtin = BUILTIN_DATE; date.id = ensureMacroId("__DATE__"); macros_["__DATE__"] = date;
-		Macro time; time.builtin = BUILTIN_TIME; time.id = ensureMacroId("__TIME__"); macros_["__TIME__"] = time;
-		Macro counter; counter.builtin = BUILTIN_COUNTER; counter.id = ensureMacroId("__COUNTER__"); macros_["__COUNTER__"] = counter;
+		Macro file; file.builtin = BUILTIN_FILE; file.id = ensureMacroId("__FILE__"); macros_[file.id] = file;
+		Macro line; line.builtin = BUILTIN_LINE; line.id = ensureMacroId("__LINE__"); macros_[line.id] = line;
+		Macro date; date.builtin = BUILTIN_DATE; date.id = ensureMacroId("__DATE__"); macros_[date.id] = date;
+		Macro time; time.builtin = BUILTIN_TIME; time.id = ensureMacroId("__TIME__"); macros_[time.id] = time;
+		Macro counter; counter.builtin = BUILTIN_COUNTER; counter.id = ensureMacroId("__COUNTER__"); macros_[counter.id] = counter;
 		Macro attribute; attribute.function_like = true;
-		attribute.parameters.push_back("attribute");
+		attribute.parameters.push_back(ensureMacroId("attribute"));
 		attribute.builtin = BUILTIN_ATTRIBUTE;
 		attribute.id = ensureMacroId("__has_cpp_attribute");
-		macros_["__has_cpp_attribute"] = attribute;
+		macros_[attribute.id] = attribute;
 	}
 
 	void process(const std::string& source, const std::string& path,
-		PreprocessedTranslationUnit& output)
+		IPreprocessedTokenSink& output, PreprocessingMetadata& metadata)
 	{
-		initialize();
-		output.tokens.clear();
-		output.source_files.clear();
+		metadata.source_files.clear();
+		IdentifierTable identifiers(metadata.identifiers,
+			metadata.identifier_slots);
+		identifiers_ = &identifiers;
+		metadata_ = &metadata;
 		output_ = &output;
+		initialize();
 		source_file_ids_.clear();
 		once_files_.clear();
 		include_depth_ = 0;
@@ -414,49 +521,212 @@ private:
 		bool saw_else;
 	};
 
+	struct FileTokenConsumer : IPPTokenStream
+	{
+		FileTokenConsumer(Preprocessor& owner, FileContext& context,
+			std::vector<Conditional>& conditions)
+			: owner(owner), context(context), conditions(conditions),
+			  current_line(1), current_column(1), has_space(false) {}
+
+		Preprocessor& owner;
+		FileContext& context;
+		std::vector<Conditional>& conditions;
+		std::vector<PreprocessingToken> line;
+		std::deque<PreprocessingToken> text;
+		std::deque<PreprocessingToken> pragma_tokens;
+		DeferredExpansion expansion;
+		DeferredPragma pragma_scan;
+		std::size_t current_line;
+		std::size_t current_column;
+		bool has_space;
+
+		void set_source_location(std::size_t line_number, std::size_t column)
+		{
+			current_line = line_number;
+			current_column = column;
+		}
+
+		void emit_whitespace_sequence()
+		{
+			if (line.empty() || line.back().kind != PP_TOKEN_WHITESPACE)
+			{
+				PreprocessingToken token;
+				token.kind = PP_TOKEN_WHITESPACE;
+				token.line = current_line;
+				token.column = current_column;
+				token.leading_space = true;
+				line.push_back(token);
+			}
+			has_space = true;
+		}
+
+		void emit_new_line()
+		{
+			processLine(true);
+			has_space = true;
+		}
+
+		bool emit_comment_new_line()
+		{
+			emit_whitespace_sequence();
+			return true;
+		}
+
+		void emit_header_name(const std::string& value)
+			{ add(PP_TOKEN_HEADER_NAME, value); }
+		void emit_identifier(const std::string& value)
+			{ add(PP_TOKEN_IDENTIFIER, value); }
+		void emit_pp_number(const std::string& value)
+			{ add(PP_TOKEN_NUMBER, value); }
+		void emit_character_literal(const std::string& value)
+			{ add(PP_TOKEN_CHARACTER, value); }
+		void emit_user_defined_character_literal(const std::string& value)
+			{ add(PP_TOKEN_USER_CHARACTER, value); }
+		void emit_string_literal(const std::string& value)
+			{ add(PP_TOKEN_STRING, value); }
+		void emit_user_defined_string_literal(const std::string& value)
+			{ add(PP_TOKEN_USER_STRING, value); }
+		void emit_character_literal(const std::string& value,
+			const std::vector<std::size_t>& offsets)
+			{ add(PP_TOKEN_CHARACTER, value, offsets); }
+		void emit_user_defined_character_literal(const std::string& value,
+			const std::vector<std::size_t>& offsets)
+			{ add(PP_TOKEN_USER_CHARACTER, value, offsets); }
+		void emit_string_literal(const std::string& value,
+			const std::vector<std::size_t>& offsets)
+			{ add(PP_TOKEN_STRING, value, offsets); }
+		void emit_user_defined_string_literal(const std::string& value,
+			const std::vector<std::size_t>& offsets)
+			{ add(PP_TOKEN_USER_STRING, value, offsets); }
+		void emit_preprocessing_op_or_punc(const std::string& value)
+			{ add(PP_TOKEN_PUNCTUATOR, value == "%:%:" ? "##" :
+				value == "%:" ? "#" : value); }
+		void emit_non_whitespace_char(const std::string& value)
+			{ add(PP_TOKEN_OTHER, value); }
+
+		void emit_eof()
+		{
+			if (!line.empty()) processLine(false);
+		}
+
+	private:
+		void add(PreprocessingTokenKind kind, const std::string& value,
+			const std::vector<std::size_t>& offsets = std::vector<std::size_t>())
+		{
+			PreprocessingToken token;
+			token.kind = kind;
+			if (kind == PP_TOKEN_IDENTIFIER)
+			{
+				token.identifier_id = owner.identifiers_->intern(value);
+				token.identifier_spelling =
+					&owner.identifiers_->names[token.identifier_id];
+			}
+			else token.spelling = value;
+			token.line = current_line;
+			token.column = current_column;
+			token.leading_space = has_space;
+			token.ucn_backslash_offsets = offsets;
+			line.push_back(token);
+			has_space = false;
+		}
+
+		void processLine(bool has_newline)
+		{
+			const std::size_t after_line = current_line + 1;
+			owner.processLine(line, has_newline, after_line, context,
+				conditions, text, pragma_tokens, expansion, pragma_scan);
+			line.clear();
+		}
+	};
+
 	struct NestedContextNode
 	{
 		std::size_t child[2];
-		NestedContextNode() { child[0] = child[1] = 0; }
+		bool terminal;
+		NestedContextNode() : terminal(false)
+			{ child[0] = child[1] = 0; }
 	};
 
-	std::unordered_map<std::string, Macro> macros_;
-	std::unordered_map<std::string, std::size_t> macro_ids_;
-	std::vector<std::string> macro_names_;
+	std::unordered_map<std::size_t, Macro> macros_;
 	std::vector<NestedContextNode> nested_context_nodes_;
-	std::vector<std::size_t> nested_contexts_;
+	std::vector<std::size_t> nested_context_slots_;
 	std::set<PreprocessorFileId> once_files_;
-	PreprocessedTranslationUnit* output_;
+	IPreprocessedTokenSink* output_;
+	PreprocessingMetadata* metadata_;
+	IdentifierTable* identifiers_;
 	std::unordered_map<std::string, std::size_t> source_file_ids_;
 	std::string date_;
 	std::string time_;
 	unsigned long long counter_;
 	std::size_t include_depth_;
+	std::size_t variadic_parameter_id_;
 
 	std::size_t ensureMacroId(const std::string& name)
 	{
-		std::unordered_map<std::string, std::size_t>::const_iterator found =
-			macro_ids_.find(name);
-		if (found != macro_ids_.end()) return found->second;
-		const std::size_t id = macro_names_.size();
-		macro_ids_[name] = id;
-		macro_names_.push_back(name);
-		return id;
+		return identifiers_->intern(name);
 	}
 
 	bool contextContains(std::size_t context, std::size_t macro_id) const
 	{
-		if (context >= nested_contexts_.size()) return false;
-		std::size_t node = nested_contexts_[context];
+		if (context >= nested_context_nodes_.size()) return false;
+		std::size_t node = context;
 		const std::size_t depth = sizeof(std::size_t) * 8;
 		for (std::size_t bit = 0; bit < depth; ++bit)
 		{
 			const std::size_t branch =
 				(macro_id >> (depth - bit - 1)) & 1;
 			if (node == 0) return false;
-			node = nested_context_nodes_[node].child[branch];
+				node = nested_context_nodes_[node].child[branch];
 		}
-		return node != 0;
+		return node != 0 && nested_context_nodes_[node].terminal;
+	}
+
+	void rehashContextNodes(std::size_t capacity)
+	{
+		nested_context_slots_.assign(capacity, 0);
+		for (std::size_t id = 1; id < nested_context_nodes_.size(); ++id)
+		{
+			const NestedContextNode& node = nested_context_nodes_[id];
+			std::size_t hash = node.child[0];
+			hash ^= node.child[1] + static_cast<std::size_t>(0x9e3779b9) +
+				(hash << 6) + (hash >> 2);
+			if (node.terminal) hash ^= static_cast<std::size_t>(0x85ebca6b);
+			std::size_t slot = hash & (capacity - 1);
+			while (nested_context_slots_[slot] != 0)
+				slot = (slot + 1) & (capacity - 1);
+			nested_context_slots_[slot] = id + 1;
+		}
+	}
+
+	std::size_t internContextNode(std::size_t child0, std::size_t child1,
+		bool terminal)
+	{
+		if (!terminal && child0 == 0 && child1 == 0) return 0;
+		if ((nested_context_nodes_.size() + 1) * 10 >=
+			nested_context_slots_.size() * 7)
+			rehashContextNodes(nested_context_slots_.size() * 2);
+		std::size_t hash = child0;
+		hash ^= child1 + static_cast<std::size_t>(0x9e3779b9) +
+			(hash << 6) + (hash >> 2);
+		if (terminal) hash ^= static_cast<std::size_t>(0x85ebca6b);
+		std::size_t slot = hash & (nested_context_slots_.size() - 1);
+		while (nested_context_slots_[slot] != 0)
+		{
+			const std::size_t id = nested_context_slots_[slot] - 1;
+			const NestedContextNode& node = nested_context_nodes_[id];
+			if (node.child[0] == child0 && node.child[1] == child1 &&
+				node.terminal == terminal)
+				return id;
+			slot = (slot + 1) & (nested_context_slots_.size() - 1);
+		}
+		NestedContextNode node;
+		node.child[0] = child0;
+		node.child[1] = child1;
+		node.terminal = terminal;
+		const std::size_t id = nested_context_nodes_.size();
+		nested_context_nodes_.push_back(node);
+		nested_context_slots_[slot] = id + 1;
+		return id;
 	}
 
 	std::size_t addContextMacro(std::size_t root, std::size_t macro_id)
@@ -473,17 +743,18 @@ private:
 				nested_context_nodes_[node].child[branches[bit]];
 			path[bit + 1] = node;
 		}
-		if (node != 0) return root;
+		if (node != 0 && nested_context_nodes_[node].terminal) return root;
 
-		nested_context_nodes_.push_back(NestedContextNode());
-		std::size_t replacement = nested_context_nodes_.size() - 1;
+		std::size_t replacement = internContextNode(0, 0, true);
 		for (std::size_t bit = depth; bit > 0; --bit)
 		{
-			NestedContextNode copy = path[bit - 1] == 0 ? NestedContextNode() :
-				nested_context_nodes_[path[bit - 1]];
-			copy.child[branches[bit - 1]] = replacement;
-			nested_context_nodes_.push_back(copy);
-			replacement = nested_context_nodes_.size() - 1;
+			const NestedContextNode previous = path[bit - 1] == 0
+				? NestedContextNode() : nested_context_nodes_[path[bit - 1]];
+			std::size_t child0 = previous.child[0];
+			std::size_t child1 = previous.child[1];
+			if (branches[bit - 1] == 0) child0 = replacement;
+			else child1 = replacement;
+			replacement = internContextNode(child0, child1, false);
 		}
 		return replacement;
 	}
@@ -491,13 +762,11 @@ private:
 	std::size_t makeContext(std::size_t parent,
 		const std::vector<std::size_t>& added)
 	{
-		std::size_t root = parent < nested_contexts_.size() ?
-			nested_contexts_[parent] : 0;
+		std::size_t root = parent < nested_context_nodes_.size() ? parent : 0;
 		for (std::size_t i = 0; i < added.size(); ++i)
-			if (added[i] < macro_names_.size())
+			if (added[i] < identifiers_->names.size())
 				root = addContextMacro(root, added[i]);
-		nested_contexts_.push_back(root);
-		return nested_contexts_.size() - 1;
+		return root;
 	}
 
 	std::size_t directContext(const PreprocessingToken& head,
@@ -507,11 +776,7 @@ private:
 		// has been expanded. Keep that suffix outside the earlier nesting chain.
 		std::vector<std::size_t> added(1, current_macro);
 		for (std::size_t i = 0; i < head.unavailable_macros.size(); ++i)
-		{
-			std::unordered_map<std::string, std::size_t>::const_iterator found =
-				macro_ids_.find(head.unavailable_macros[i]);
-			if (found != macro_ids_.end()) added.push_back(found->second);
-		}
+			added.push_back(head.unavailable_macros[i]);
 		return makeContext(detached_invocation ? 0 : head.nested_context, added);
 	}
 
@@ -524,14 +789,12 @@ private:
 		// For nested expansion tokens, only an ancestor matching this identifier
 		// survives parameter substitution.
 		if (!head.macro_generated) added.push_back(current_macro);
-		std::unordered_map<std::string, std::size_t>::const_iterator token_id =
-			macro_ids_.find(token.spelling);
-		if (token_id != macro_ids_.end())
+		if (token.identifier_id != static_cast<std::size_t>(-1))
 		{
-			if (contextContains(head.nested_context, token_id->second) ||
-				ContainsName(head.unavailable_macros, token.spelling))
-				added.push_back(token_id->second);
-			if (token.spelling == macro_names_[current_macro])
+			if (contextContains(head.nested_context, token.identifier_id) ||
+				ContainsName(head.unavailable_macros, token.identifier_id))
+				added.push_back(token.identifier_id);
+			if (token.identifier_id == current_macro)
 				added.push_back(current_macro);
 		}
 		return makeContext(0, added);
@@ -553,8 +816,8 @@ private:
 		std::unordered_map<std::string, std::size_t>::const_iterator found =
 			source_file_ids_.find(path);
 		if (found != source_file_ids_.end()) return found->second;
-		const std::size_t id = output_->source_files.size();
-		output_->source_files.push_back(path);
+		const std::size_t id = metadata_->source_files.size();
+		metadata_->source_files.push_back(path);
 		source_file_ids_[path] = id;
 		return id;
 	}
@@ -602,64 +865,75 @@ private:
 		FileContext context;
 		context.path = physical_path;
 		context.line_adjustment = line_adjustment;
-		const std::vector<PreprocessingToken> tokens = Tokenize(source);
 		std::vector<Conditional> conditions;
-		std::vector<PreprocessingToken> text;
-		std::size_t begin = 0;
-		while (begin < tokens.size())
-		{
-			std::size_t end = begin;
-			while (end < tokens.size() && tokens[end].kind != PP_TOKEN_NEWLINE) ++end;
-			std::vector<PreprocessingToken> line(tokens.begin() + begin,
-				tokens.begin() + end);
-			locateLine(line, context);
-			std::size_t hash = SkipWhitespace(line, 0);
-			const bool directive = hash < line.size() &&
-				line[hash].kind == PP_TOKEN_PUNCTUATOR &&
-				normalizedPunctuator(line[hash]) == "#";
-			if (directive)
-			{
-				flushText(text, context);
-				const std::size_t after_line = end < tokens.size()
-					? tokens[end].line + 1
-					: (line.empty() ? 1 : line.back().line + 1);
-				processDirective(line, hash, after_line, context, conditions);
-			}
-			else if (isActive(conditions))
-			{
-				text.insert(text.end(), line.begin(), line.end());
-				if (end < tokens.size())
-				{
-					PreprocessingToken space;
-					space.kind = PP_TOKEN_WHITESPACE;
-					const long long presumed = logicalLine(context, tokens[end].line);
-					space.line = presumed > 0 ? static_cast<std::size_t>(presumed) :
-						tokens[end].line;
-					space.column = tokens[end].column;
-					space.source_file_id = internSourceFile(context.path);
-					space.leading_space = true;
-					text.push_back(space);
-				}
-			}
-			begin = end < tokens.size() ? end + 1 : tokens.size();
-		}
-		flushText(text, context);
+		FileTokenConsumer tokens(*this, context, conditions);
+		TokenizePreprocessingSource(source, tokens);
+		flushText(tokens.text, tokens.pragma_tokens, tokens.expansion,
+			tokens.pragma_scan, context, true);
 		if (!conditions.empty())
 			throw std::runtime_error("unterminated conditional inclusion group");
 		--include_depth_;
 	}
 
-	void flushText(std::vector<PreprocessingToken>& text,
-		const FileContext& context)
+	void processLine(std::vector<PreprocessingToken>& line, bool has_newline,
+		std::size_t after_line, FileContext& context,
+		std::vector<Conditional>& conditions,
+		std::deque<PreprocessingToken>& text,
+		std::deque<PreprocessingToken>& pragma_tokens,
+		DeferredExpansion& expansion, DeferredPragma& pragma_scan)
 	{
-		if (text.empty()) return;
-		for (std::size_t i = 0; i < text.size(); ++i)
-			if (IsIdentifier(text[i], "__VA_ARGS__"))
-				throw std::runtime_error("__VA_ARGS__ outside a variadic macro");
-		std::vector<PreprocessingToken> expanded = expand(text, context);
-		text.clear();
-		executePragmaOperators(expanded, context);
-		output_->tokens.insert(output_->tokens.end(), expanded.begin(), expanded.end());
+		locateLine(line, context);
+		const std::size_t hash = SkipWhitespace(line, 0);
+		const bool directive = hash < line.size() &&
+			line[hash].kind == PP_TOKEN_PUNCTUATOR &&
+			normalizedPunctuator(line[hash]) == "#";
+		if (directive)
+		{
+			flushText(text, pragma_tokens, expansion, pragma_scan,
+				context, true);
+			processDirective(line, hash, after_line, context, conditions);
+		}
+		else if (isActive(conditions))
+		{
+			for (std::size_t i = 0; i < line.size(); ++i)
+				if (IsIdentifier(line[i], "__VA_ARGS__"))
+					throw std::runtime_error(
+						"__VA_ARGS__ outside a variadic macro");
+			for (std::size_t i = 0; i < line.size(); ++i)
+			{
+				if (IsWhitespace(line[i]) && !text.empty() &&
+					IsWhitespace(text.back()))
+					continue;
+				text.push_back(line[i]);
+			}
+			if (has_newline)
+			{
+				PreprocessingToken space;
+				space.kind = PP_TOKEN_WHITESPACE;
+				const std::size_t physical_line = after_line - 1;
+				const long long presumed = logicalLine(context, physical_line);
+				space.line = presumed > 0 ? static_cast<std::size_t>(presumed) :
+					physical_line;
+				space.column = 1;
+				space.source_file_id = internSourceFile(context.path);
+				space.leading_space = true;
+				if (text.empty() || !IsWhitespace(text.back()))
+					text.push_back(space);
+			}
+			flushText(text, pragma_tokens, expansion, pragma_scan,
+				context, false);
+		}
+	}
+
+	void flushText(std::deque<PreprocessingToken>& text,
+		std::deque<PreprocessingToken>& pragma_tokens,
+		DeferredExpansion& expansion, DeferredPragma& pragma_scan,
+		const FileContext& context, bool final)
+	{
+		const std::vector<PreprocessingToken> expanded =
+			expandPending(text, context, expansion, final);
+		consumePragmaOperators(pragma_tokens, expanded, pragma_scan,
+			context, final);
 	}
 
 	void processDirective(const std::vector<PreprocessingToken>& line,
@@ -674,7 +948,7 @@ private:
 				throw std::runtime_error("invalid preprocessing directive");
 			return;
 		}
-		const std::string name = line[name_index].spelling;
+		const std::string name = *line[name_index].identifier_spelling;
 		const std::size_t args = name_index + 1;
 		const bool parent_active = isActive(conditions);
 
@@ -692,7 +966,7 @@ private:
 					const std::vector<PreprocessingToken> words = NonWhitespace(rest);
 					if (words.size() != 1 || words[0].kind != PP_TOKEN_IDENTIFIER)
 						throw std::runtime_error("invalid #ifdef or #ifndef directive");
-					condition = macros_.find(words[0].spelling) != macros_.end();
+					condition = macros_.find(words[0].identifier_id) != macros_.end();
 					if (name == "ifndef") condition = !condition;
 				}
 			}
@@ -754,8 +1028,8 @@ private:
 		std::size_t i = SkipWhitespace(line, args);
 		if (i == line.size() || line[i].kind != PP_TOKEN_IDENTIFIER)
 			throw std::runtime_error("#define requires a macro name");
-		const std::string name = line[i].spelling;
-		if (name == "__VA_ARGS__")
+		const std::size_t name_id = line[i].identifier_id;
+		if (name_id == variadic_parameter_id_)
 			throw std::runtime_error("__VA_ARGS__ cannot be a macro name");
 		++i;
 		Macro macro;
@@ -773,30 +1047,30 @@ private:
 				for (;;)
 				{
 					i = SkipWhitespace(line, i);
-					if (i >= line.size())
-						throw std::runtime_error("unterminated macro parameter list");
-					if (IsPunctuator(line[i], "..."))
-					{
-						if (!need_parameter)
-							throw std::runtime_error("invalid variadic macro parameters");
-						macro.variadic = true;
-						++i;
+						if (i >= line.size())
+							throw std::runtime_error("unterminated macro parameter list");
+						if (IsPunctuator(line[i], "..."))
+						{
+							if (!need_parameter)
+								throw std::runtime_error("invalid variadic macro parameters");
+							macro.variadic = true;
+							++i;
 						i = SkipWhitespace(line, i);
 						if (i == line.size() || !IsPunctuator(line[i], ")"))
 							throw std::runtime_error("variadic parameter must be last");
 						++i;
 						break;
 					}
-					if (line[i].kind != PP_TOKEN_IDENTIFIER)
-						throw std::runtime_error("invalid macro parameter");
-					const std::string parameter = line[i++].spelling;
-					if (parameter == "__VA_ARGS__")
-						throw std::runtime_error("__VA_ARGS__ cannot be a parameter name");
+						if (line[i].kind != PP_TOKEN_IDENTIFIER)
+							throw std::runtime_error("invalid macro parameter");
+						const std::size_t parameter = line[i++].identifier_id;
+						if (parameter == variadic_parameter_id_)
+							throw std::runtime_error("__VA_ARGS__ cannot be a parameter name");
 					if (std::find(macro.parameters.begin(), macro.parameters.end(),
 						parameter) != macro.parameters.end())
 						throw std::runtime_error("duplicate macro parameter");
 					macro.parameters.push_back(parameter);
-					i = SkipWhitespace(line, i);
+							i = SkipWhitespace(line, i);
 					if (i < line.size() && IsPunctuator(line[i], ")"))
 					{
 						++i;
@@ -831,11 +1105,12 @@ private:
 		while (i < line.size() && IsWhitespace(line[i])) ++i;
 		macro.replacement.assign(line.begin() + i, line.end());
 		validateReplacement(macro);
-		macro.id = ensureMacroId(name);
-		std::unordered_map<std::string, Macro>::iterator previous = macros_.find(name);
+		macro.id = name_id;
+		std::unordered_map<std::size_t, Macro>::iterator previous =
+			macros_.find(name_id);
 		if (previous != macros_.end() && !sameDefinition(previous->second, macro))
 			throw std::runtime_error("incompatible macro redefinition");
-		macros_[name] = macro;
+		macros_[name_id] = macro;
 	}
 
 	void validateReplacement(const Macro& macro)
@@ -852,14 +1127,15 @@ private:
 			{
 				if (i + 1 == words.size() ||
 					words[i + 1].kind != PP_TOKEN_IDENTIFIER ||
-					(!isParameter(macro, words[i + 1].spelling) &&
-					!(macro.variadic && words[i + 1].spelling == "__VA_ARGS__")))
+						(!isParameter(macro, words[i + 1].identifier_id) &&
+						!(macro.variadic &&
+							words[i + 1].identifier_id == variadic_parameter_id_)))
 					throw std::runtime_error("# must precede a macro parameter");
 			}
 		}
 	}
 
-	bool isParameter(const Macro& macro, const std::string& name) const
+	bool isParameter(const Macro& macro, std::size_t name) const
 	{
 		return std::find(macro.parameters.begin(), macro.parameters.end(), name) !=
 			macro.parameters.end();
@@ -874,8 +1150,12 @@ private:
 		if (left.size() != right.size()) return false;
 		for (std::size_t i = 0; i < left.size(); ++i)
 		{
-			if (left[i].kind != right[i].kind || left[i].spelling != right[i].spelling)
-				return false;
+			if (left[i].kind != right[i].kind) return false;
+			if (left[i].kind == PP_TOKEN_IDENTIFIER)
+			{
+				if (left[i].identifier_id != right[i].identifier_id) return false;
+			}
+			else if (left[i].spelling != right[i].spelling) return false;
 			if (i > 0 && left[i].leading_space != right[i].leading_space)
 				return false;
 		}
@@ -888,13 +1168,13 @@ private:
 		const std::vector<PreprocessingToken> words = NonWhitespace(rest);
 		if (words.size() != 1 || words[0].kind != PP_TOKEN_IDENTIFIER)
 			throw std::runtime_error("#undef requires one macro name");
-		if (words[0].spelling == "__VA_ARGS__")
+		if (words[0].identifier_id == variadic_parameter_id_)
 			throw std::runtime_error("__VA_ARGS__ cannot be undefined");
-		macros_.erase(words[0].spelling);
+		macros_.erase(words[0].identifier_id);
 	}
 
 	std::vector<PreprocessingToken> substitute(const Macro& macro,
-		const std::string& macro_name, const PreprocessingToken& head,
+		const PreprocessingToken& head,
 		const std::vector<std::vector<PreprocessingToken> >& arguments,
 		const FileContext& context, bool detached_invocation)
 	{
@@ -922,12 +1202,12 @@ private:
 				std::size_t previous = result.size();
 				while (previous > 0 && IsWhitespace(result[previous - 1])) --previous;
 				const std::size_t next = SkipWhitespace(macro.replacement, i + 1);
-				if (previous > 0 && result[previous - 1].spelling == "," &&
+				if (previous > 0 && Spelling(result[previous - 1]) == "," &&
 					next < macro.replacement.size() &&
 					IsIdentifier(macro.replacement[next], "__VA_ARGS__"))
 				{
 					const std::size_t variadic_index = parameterIndex(macro,
-						"__VA_ARGS__", arguments.size());
+						variadic_parameter_id_, arguments.size());
 					if (!NonWhitespace(arguments[variadic_index]).empty())
 						continue; // GNU comma elision leaves the comma for nonempty packs.
 				}
@@ -935,13 +1215,14 @@ private:
 			if (IsPunctuator(token, "#") && macro.function_like)
 			{
 				std::size_t param = SkipWhitespace(macro.replacement, i + 1);
-				const std::string parameter = macro.replacement[param].spelling;
+				const std::size_t parameter =
+					macro.replacement[param].identifier_id;
 				const std::size_t argument_index = parameterIndex(macro, parameter,
 					arguments.size());
 				const std::string stringized = stringify(arguments[argument_index]);
 				PreprocessingToken value = generated(PP_TOKEN_STRING, stringized, head);
 				value.unavailable_macros = UnionNames(head.unavailable_macros,
-					std::vector<std::string>(1, macro_name));
+					std::vector<std::size_t>(1, macro.id));
 				result.push_back(value);
 				i = param;
 				continue;
@@ -949,7 +1230,7 @@ private:
 			if (token.kind == PP_TOKEN_IDENTIFIER)
 			{
 				const std::size_t argument_index = parameterIndex(macro,
-					token.spelling, arguments.size());
+					token.identifier_id, arguments.size());
 				if (argument_index != arguments.size())
 				{
 					const bool pasted = adjacentToPaste(macro.replacement, i);
@@ -969,8 +1250,8 @@ private:
 						marker.placemarker = true;
 						result.push_back(marker);
 					}
-						else
-						{
+					else
+					{
 						for (std::size_t j = 0; j < value->size(); ++j)
 						{
 							PreprocessingToken argument_token = (*value)[j];
@@ -978,13 +1259,11 @@ private:
 							argument_token.line = head.line;
 							argument_token.column = head.column;
 							argument_token.source_file_id = head.source_file_id;
-							std::size_t key = std::numeric_limits<std::size_t>::max();
-							if (argument_token.kind == PP_TOKEN_IDENTIFIER)
-							{
-								const std::unordered_map<std::string, std::size_t>::const_iterator id =
-									macro_ids_.find(argument_token.spelling);
-								if (id != macro_ids_.end()) key = id->second;
-							}
+								std::size_t key = std::numeric_limits<std::size_t>::max();
+								if (argument_token.kind == PP_TOKEN_IDENTIFIER)
+								{
+									key = argument_token.identifier_id;
+								}
 							std::unordered_map<std::size_t, std::size_t>::const_iterator cached =
 								substitution_contexts.find(key);
 							if (cached == substitution_contexts.end())
@@ -996,7 +1275,7 @@ private:
 						}
 					continue;
 				}
-			}
+				}
 				PreprocessingToken copy = token;
 				copy.line = head.line;
 				copy.column = head.column;
@@ -1005,16 +1284,16 @@ private:
 				copy.macro_generated = true;
 			result.push_back(copy);
 		}
-		applyPastes(result, macro_name, head);
+		applyPastes(result, macro.id, head);
 		return result;
 	}
 
-	std::size_t parameterIndex(const Macro& macro, const std::string& name,
+	std::size_t parameterIndex(const Macro& macro, std::size_t name,
 		std::size_t argument_count) const
 	{
 		for (std::size_t i = 0; i < macro.parameters.size(); ++i)
 			if (macro.parameters[i] == name) return i;
-		if (macro.variadic && name == "__VA_ARGS__")
+		if (macro.variadic && name == variadic_parameter_id_)
 			return argument_count == 0 ? 0 : argument_count - 1;
 		return argument_count;
 	}
@@ -1048,12 +1327,12 @@ private:
 				argument[i].kind == PP_TOKEN_USER_STRING ||
 				argument[i].kind == PP_TOKEN_CHARACTER ||
 				argument[i].kind == PP_TOKEN_USER_CHARACTER;
-			for (std::size_t j = 0; j < argument[i].spelling.size(); ++j)
+			const std::string& spelling = Spelling(argument[i]);
+			for (std::size_t j = 0; j < spelling.size(); ++j)
 			{
-				if (literal && (argument[i].spelling[j] == '\\' ||
-					argument[i].spelling[j] == '"'))
+				if (literal && (spelling[j] == '\\' || spelling[j] == '"'))
 					body.push_back('\\');
-				body.push_back(argument[i].spelling[j]);
+				body.push_back(spelling[j]);
 			}
 			wrote_token = true;
 			pending_space = false;
@@ -1062,7 +1341,7 @@ private:
 	}
 
 	PreprocessingToken pasteTokens(const PreprocessingToken& a,
-		const PreprocessingToken& b, const std::string& macro_name,
+		const PreprocessingToken& b, std::size_t macro_id,
 		const PreprocessingToken& head)
 	{
 		PreprocessingToken joined;
@@ -1076,7 +1355,7 @@ private:
 			joined = b;
 		else if (b.placemarker)
 		{
-			if (a.spelling == ",")
+			if (Spelling(a) == ",")
 			{
 				joined.placemarker = true;
 				joined.kind = PP_TOKEN_OTHER;
@@ -1085,13 +1364,14 @@ private:
 		}
 		else
 		{
-			const std::string spelling = a.spelling + b.spelling;
-			const std::vector<PreprocessingToken> pasted = Tokenize(spelling);
+			const std::string spelling = Spelling(a) + Spelling(b);
+			const std::vector<PreprocessingToken> pasted = Tokenize(spelling,
+				*identifiers_);
 			std::vector<PreprocessingToken> words = NonWhitespace(pasted);
 			if (words.size() != 1 || words[0].kind == PP_TOKEN_OTHER ||
 				words[0].kind == PP_TOKEN_HEADER_NAME)
 				throw std::runtime_error("token paste does not form one preprocessing token: " +
-					a.spelling + " ## " + b.spelling);
+					Spelling(a) + " ## " + Spelling(b));
 			joined = words[0];
 			joined.line = head.line;
 			joined.column = head.column;
@@ -1104,18 +1384,13 @@ private:
 		joined.line = head.line;
 		joined.column = head.column;
 		joined.source_file_id = head.source_file_id;
-		const std::unordered_map<std::string, std::size_t>::const_iterator macro_id =
-			macro_ids_.find(macro_name);
-		if (macro_id != macro_ids_.end())
-		{
-			joined.nested_context = substitutionContext(joined, macro_id->second, head);
-		}
+		joined.nested_context = substitutionContext(joined, macro_id, head);
 		joined.paste_result = IsPunctuator(joined, "##");
 		return joined;
 	}
 
 	void applyPastes(std::vector<PreprocessingToken>& tokens,
-		const std::string& macro_name, const PreprocessingToken& head)
+		std::size_t macro_id, const PreprocessingToken& head)
 	{
 		std::vector<PreprocessingToken> result;
 		result.reserve(tokens.size());
@@ -1135,7 +1410,7 @@ private:
 			const PreprocessingToken a = result[left - 1];
 			const PreprocessingToken b = tokens[right];
 			result.erase(result.begin() + left - 1, result.end());
-			result.push_back(pasteTokens(a, b, macro_name, head));
+			result.push_back(pasteTokens(a, b, macro_id, head));
 			i = right;
 		}
 		result.erase(std::remove_if(result.begin(), result.end(),
@@ -1148,28 +1423,81 @@ private:
 		const std::vector<PreprocessingToken>& input, const FileContext& context)
 	{
 		std::deque<PreprocessingToken> pending(input.begin(), input.end());
+		DeferredExpansion expansion;
+		return expandPending(pending, context, expansion, true);
+	}
+
+	DeferredScanResult scanDeferred(
+		const std::deque<PreprocessingToken>& tail,
+		DeferredExpansion& expansion) const
+	{
+		if (!expansion.saw_open)
+		{
+			while (expansion.scan_index < tail.size() &&
+				IsWhitespace(tail[expansion.scan_index]))
+				++expansion.scan_index;
+			if (expansion.scan_index == tail.size()) return DEFERRED_WAIT;
+			if (!IsPunctuator(tail[expansion.scan_index], "("))
+				return DEFERRED_NOT_CALL;
+			expansion.saw_open = true;
+			expansion.depth = 0;
+			++expansion.scan_index;
+		}
+		while (expansion.scan_index < tail.size())
+		{
+			const PreprocessingToken& token = tail[expansion.scan_index++];
+			if (IsPunctuator(token, "(")) ++expansion.depth;
+			else if (IsPunctuator(token, ")"))
+			{
+				if (expansion.depth == 0) return DEFERRED_COMPLETE;
+				--expansion.depth;
+			}
+		}
+		return DEFERRED_WAIT;
+	}
+
+	std::vector<PreprocessingToken> expandPending(
+		std::deque<PreprocessingToken>& pending, const FileContext& context,
+		DeferredExpansion& expansion, bool final)
+	{
 		std::vector<PreprocessingToken> output;
+		bool ready_deferred_invocation = false;
+		if (expansion.active)
+		{
+			if (pending.empty())
+				expansion = DeferredExpansion();
+			else
+			{
+				const PreprocessingToken head = pending.front();
+				pending.pop_front();
+				const DeferredScanResult state = scanDeferred(pending, expansion);
+				pending.push_front(head);
+				if (state == DEFERRED_WAIT && !final) return output;
+				ready_deferred_invocation = state == DEFERRED_COMPLETE;
+				expansion = DeferredExpansion();
+			}
+		}
 		while (!pending.empty())
 		{
 			PreprocessingToken token = pending.front();
 			pending.pop_front();
+			const bool already_scanned = ready_deferred_invocation;
+			ready_deferred_invocation = false;
 			if (token.kind != PP_TOKEN_IDENTIFIER ||
-				ContainsName(token.unavailable_macros, token.spelling))
+				ContainsName(token.unavailable_macros, token.identifier_id))
 			{
 				if (!token.placemarker) output.push_back(token);
 				continue;
 			}
-			const std::unordered_map<std::string, std::size_t>::const_iterator token_id =
-				macro_ids_.find(token.spelling);
-			if (token_id != macro_ids_.end() &&
-				contextContains(token.nested_context, token_id->second))
+			const std::unordered_map<std::size_t, Macro>::const_iterator found =
+				macros_.find(token.identifier_id);
+			if (found != macros_.end() &&
+				contextContains(token.nested_context, token.identifier_id))
 			{
-				AddName(token.unavailable_macros, token.spelling);
+				AddName(token.unavailable_macros, token.identifier_id);
 				output.push_back(token);
 				continue;
 			}
-			std::unordered_map<std::string, Macro>::const_iterator found =
-				macros_.find(token.spelling);
 			if (found == macros_.end())
 			{
 				output.push_back(token);
@@ -1181,15 +1509,42 @@ private:
 			if (macro.function_like)
 			{
 				std::size_t open_at = 0;
-				while (open_at < pending.size() && IsWhitespace(pending[open_at])) ++open_at;
-				if (open_at == pending.size() || !IsPunctuator(pending[open_at], "("))
+				while (open_at < pending.size() && IsWhitespace(pending[open_at]))
+					++open_at;
+				if (open_at == pending.size())
+				{
+					if (!final)
+					{
+						expansion.active = true;
+						expansion.scan_index = open_at;
+						pending.push_front(token);
+						break;
+					}
+					output.push_back(token);
+					continue;
+				}
+				if (!IsPunctuator(pending[open_at], "("))
 				{
 					output.push_back(token);
 					continue;
 				}
+				if (!final && !already_scanned)
+				{
+					DeferredExpansion probe;
+					probe.active = true;
+					probe.saw_open = true;
+					probe.scan_index = open_at + 1;
+					if (scanDeferred(pending, probe) == DEFERRED_WAIT)
+					{
+						expansion = probe;
+						pending.push_front(token);
+						break;
+					}
+				}
 				detached_invocation = token.nested_context != 0 &&
 					pending[open_at].nested_context == 0;
-				for (std::size_t i = 0; i <= open_at; ++i) pending.pop_front();
+				for (std::size_t i = 0; i <= open_at; ++i)
+					pending.pop_front();
 				arguments = collectArguments(pending);
 				validateArgumentCount(macro, arguments);
 				if (macro.builtin == BUILTIN_ATTRIBUTE)
@@ -1198,7 +1553,7 @@ private:
 					PreprocessingToken value = generated(PP_TOKEN_NUMBER,
 						known ? "201803" : "0", token);
 					value.unavailable_macros = UnionNames(token.unavailable_macros,
-						std::vector<std::string>(1, "__has_cpp_attribute"));
+						std::vector<std::size_t>(1, macro.id));
 					pending.push_front(value);
 					continue;
 				}
@@ -1208,7 +1563,7 @@ private:
 				macro.builtin != BUILTIN_ATTRIBUTE)
 				replacement = expandBuiltin(macro.builtin, token, context);
 			else
-				replacement = substitute(macro, token.spelling, token,
+				replacement = substitute(macro, token,
 					arguments, context, detached_invocation);
 			for (std::vector<PreprocessingToken>::reverse_iterator i =
 				replacement.rbegin(); i != replacement.rend(); ++i)
@@ -1288,7 +1643,7 @@ private:
 	{
 		std::string name;
 		for (std::size_t i = 0; i < argument.size(); ++i)
-			if (!IsWhitespace(argument[i])) name += argument[i].spelling;
+			if (!IsWhitespace(argument[i])) name += Spelling(argument[i]);
 		return name == "no_unique_address" || name == "__no_unique_address__"
 			? 201803ULL : 0ULL;
 	}
@@ -1330,26 +1685,18 @@ private:
 		for (std::size_t i = 0; i < expression.size(); ++i)
 		{
 			if (expression[i].kind == PP_TOKEN_IDENTIFIER &&
-				expression[i].spelling != "true" && expression[i].spelling != "false" &&
-				!IsAltOperator(expression[i].spelling))
-			{
-				expression[i].kind = PP_TOKEN_NUMBER;
-				expression[i].spelling = "0";
-			}
-		}
-		std::string source;
-		for (std::size_t i = 0; i < expression.size(); ++i)
-		{
-			if (IsWhitespace(expression[i])) source.push_back(' ');
-			else
-		{
-			if (!source.empty() && source[source.size() - 1] != ' ') source.push_back(' ');
-			source += expression[i].spelling;
-			source.push_back(' ');
-		}
+				!IsIdentifier(expression[i], "true") &&
+				!IsIdentifier(expression[i], "false") &&
+				!IsAltOperator(Spelling(expression[i])))
+				{
+					expression[i].kind = PP_TOKEN_NUMBER;
+					expression[i].spelling = "0";
+					expression[i].identifier_id = static_cast<std::size_t>(-1);
+					expression[i].identifier_spelling = 0;
+				}
 		}
 		std::ostringstream evaluated;
-		EvaluateControlExpressions(source, evaluated);
+		EvaluateControlExpressionTokens(expression, evaluated);
 		const std::string value = evaluated.str();
 		if (value.empty() || value.find("error") != std::string::npos)
 			throw std::runtime_error("invalid controlling expression");
@@ -1379,8 +1726,8 @@ private:
 				 !(input[operand].kind == PP_TOKEN_PUNCTUATOR &&
 					IsAltOperator(input[operand].spelling))))
 				throw std::runtime_error("defined requires an identifier");
-		const bool is_defined = input[operand].kind == PP_TOKEN_IDENTIFIER &&
-			macros_.find(input[operand].spelling) != macros_.end();
+			const bool is_defined = input[operand].kind == PP_TOKEN_IDENTIFIER &&
+				macros_.find(input[operand].identifier_id) != macros_.end();
 			std::size_t last = operand;
 			if (paren)
 			{
@@ -1391,6 +1738,8 @@ private:
 			PreprocessingToken value = input[i];
 			value.kind = PP_TOKEN_NUMBER;
 			value.spelling = is_defined ? "1" : "0";
+			value.identifier_id = static_cast<std::size_t>(-1);
+			value.identifier_spelling = 0;
 			output.push_back(value);
 			i = last;
 		}
@@ -1430,10 +1779,10 @@ private:
 			once_files_.find(file_id) != once_files_.end()) return;
 		std::ifstream input(selected.c_str(), std::ios::binary);
 		if (!input) throw std::runtime_error("unable to read include file");
-		std::ostringstream content;
-		content << input.rdbuf();
+		const std::string content((std::istreambuf_iterator<char>(input)),
+			std::istreambuf_iterator<char>());
 		if (input.bad()) throw std::runtime_error("failed to read include file");
-		processFile(content.str(), selected, 0);
+		processFile(content, selected, 0);
 	}
 
 	void lineControl(const std::vector<PreprocessingToken>& line,
@@ -1474,48 +1823,113 @@ private:
 		throw std::runtime_error("unsupported pragma");
 	}
 
-	void executePragmaOperators(std::vector<PreprocessingToken>& tokens,
-		const FileContext& context)
+	void consumePragmaOperators(
+		std::deque<PreprocessingToken>& pending,
+		const std::vector<PreprocessingToken>& tokens,
+		DeferredPragma& scan, const FileContext& context, bool final)
 	{
 		for (std::size_t i = 0; i < tokens.size(); ++i)
 		{
-			if (!IsIdentifier(tokens[i], "_Pragma")) continue;
-			const std::size_t open = SkipWhitespace(tokens, i + 1);
-			if (open == tokens.size() || !IsPunctuator(tokens[open], "("))
-				throw std::runtime_error("_Pragma must be followed by a string operand");
-			const std::size_t literal = SkipWhitespace(tokens, open + 1);
-			if (literal == tokens.size() || tokens[literal].kind != PP_TOKEN_STRING)
-				throw std::runtime_error("_Pragma requires a string literal");
-			const std::size_t close = SkipWhitespace(tokens, literal + 1);
-			if (close == tokens.size() || !IsPunctuator(tokens[close], ")"))
-				throw std::runtime_error("_Pragma invocation is not closed");
-			const std::string body = DecodeOrdinaryString(tokens[literal].spelling);
-			std::istringstream pragma_input(body);
-			std::string pragma_name;
-			pragma_input >> pragma_name;
-			if (pragma_name == "once")
+			if (scan.active && IsWhitespace(tokens[i]) && !pending.empty() &&
+				IsWhitespace(pending.back()))
+				continue;
+			pending.push_back(tokens[i]);
+		}
+		while (!pending.empty())
+		{
+			if (!IsIdentifier(pending.front(), "_Pragma"))
 			{
-				PreprocessorFileId id;
-				if (GetPreprocessorFileId(context.path, id)) once_files_.insert(id);
+				output_->emit_preprocessed_token(pending.front());
+				pending.pop_front();
+				continue;
 			}
-			else if (pragma_name != "cppgm_mock_unknown")
-				throw std::runtime_error("unsupported _Pragma operand");
-			tokens.erase(tokens.begin() + i, tokens.begin() + close + 1);
-			if (i > 0 && i < tokens.size() && IsWhitespace(tokens[i - 1]) &&
-				IsWhitespace(tokens[i]))
-				tokens.erase(tokens.begin() + i);
-			if (i > 0) --i;
+			if (!scan.active)
+			{
+				scan.active = true;
+				scan.phase = PRAGMA_EXPECT_OPEN;
+				scan.scan_index = 1;
+			}
+			bool complete = false;
+			while (!complete)
+			{
+				if (scan.phase == PRAGMA_EXPECT_OPEN)
+				{
+					while (scan.scan_index < pending.size() &&
+						IsWhitespace(pending[scan.scan_index]))
+						++scan.scan_index;
+					if (scan.scan_index == pending.size())
+					{
+						if (!final) return;
+						throw std::runtime_error(
+							"_Pragma must be followed by a string operand");
+					}
+					if (!IsPunctuator(pending[scan.scan_index], "("))
+						throw std::runtime_error(
+							"_Pragma must be followed by a string operand");
+					++scan.scan_index;
+					scan.phase = PRAGMA_EXPECT_STRING;
+				}
+				else if (scan.phase == PRAGMA_EXPECT_STRING)
+				{
+					while (scan.scan_index < pending.size() &&
+						IsWhitespace(pending[scan.scan_index]))
+						++scan.scan_index;
+					if (scan.scan_index == pending.size())
+					{
+						if (!final) return;
+						throw std::runtime_error("_Pragma requires a string literal");
+					}
+					if (pending[scan.scan_index].kind != PP_TOKEN_STRING)
+						throw std::runtime_error("_Pragma requires a string literal");
+					scan.literal_index = scan.scan_index++;
+					scan.phase = PRAGMA_EXPECT_CLOSE;
+				}
+				else
+				{
+					while (scan.scan_index < pending.size() &&
+						IsWhitespace(pending[scan.scan_index]))
+						++scan.scan_index;
+					if (scan.scan_index == pending.size())
+					{
+						if (!final) return;
+						throw std::runtime_error(
+							"_Pragma invocation is not closed");
+					}
+					if (!IsPunctuator(pending[scan.scan_index], ")"))
+						throw std::runtime_error(
+							"_Pragma invocation is not closed");
+					const std::string body = DecodeOrdinaryString(
+						pending[scan.literal_index].spelling);
+					std::istringstream pragma_input(body);
+					std::string pragma_name;
+					pragma_input >> pragma_name;
+					if (pragma_name == "once")
+					{
+						PreprocessorFileId id;
+						if (GetPreprocessorFileId(context.path, id))
+							once_files_.insert(id);
+					}
+					else if (pragma_name != "cppgm_mock_unknown")
+						throw std::runtime_error("unsupported _Pragma operand");
+					for (std::size_t i = 0; i <= scan.scan_index; ++i)
+						pending.pop_front();
+					scan = DeferredPragma();
+					complete = true;
+				}
+			}
 		}
 	}
+
+
 };
 
 } // namespace
 
 bool PreprocessTranslationUnit(const std::string& source, const std::string& path,
-	PreprocessedTranslationUnit& output, const std::string& build_date,
-	const std::string& build_time)
+	IPreprocessedTokenSink& output, PreprocessingMetadata& metadata,
+	const std::string& build_date, const std::string& build_time)
 {
 	Preprocessor preprocessor(build_date, build_time);
-	preprocessor.process(source, path, output);
+	preprocessor.process(source, path, output, metadata);
 	return true;
 }

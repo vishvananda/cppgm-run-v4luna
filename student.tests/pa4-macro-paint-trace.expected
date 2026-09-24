@@ -1,0 +1,29 @@
+preproc 1
+sof student.tests/pa4-macro-paint-trace.t
+literal 1 int 01000000
+literal 2 int 02000000
+identifier f
+simple ( OP_LPAREN
+literal 1 int 01000000
+literal 2 int 02000000
+identifier f
+simple ( OP_LPAREN
+identifier x
+simple ) OP_RPAREN
+simple ) OP_RPAREN
+literal 1 int 01000000
+identifier z
+simple [ OP_LSQUARE
+literal 0 int 00000000
+simple ] OP_RSQUARE
+literal 2 int 02000000
+literal 1 int 01000000
+identifier g3
+simple ( OP_LPAREN
+literal 3 int 03000000
+simple ) OP_RPAREN
+literal 17 int 11000000
+literal 19 int 13000000
+literal 23 int 17000000
+literal 29 int 1D000000
+eof

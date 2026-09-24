@@ -1485,56 +1485,82 @@ void PostTokenizeSource(const string& source)
 bool PostTokenizePreprocessingTokens(
 	const vector<PreprocessingToken>& tokens, ostream& output, bool emit_eof)
 {
-	PostTokenConsumer consumer(output);
+	PostTokenStreamWriter writer(output);
 	for (size_t i = 0; i < tokens.size(); ++i)
+		if (!writer.emit(tokens[i])) return false;
+	return writer.finish(emit_eof);
+}
+
+class PostTokenStreamWriter::Impl
+{
+public:
+	explicit Impl(ostream& output) : consumer(output) {}
+	PostTokenConsumer consumer;
+};
+
+PostTokenStreamWriter::PostTokenStreamWriter(ostream& output)
+	: impl_(new Impl(output))
+{}
+
+PostTokenStreamWriter::~PostTokenStreamWriter()
+{
+	delete impl_;
+}
+
+bool PostTokenStreamWriter::emit(const PreprocessingToken& token)
+{
+	switch (token.kind)
 	{
-		const PreprocessingToken& token = tokens[i];
-		switch (token.kind)
-		{
-		case PP_TOKEN_WHITESPACE:
-			consumer.emit_whitespace_sequence();
-			break;
-		case PP_TOKEN_NEWLINE:
-			consumer.emit_new_line();
-			break;
-		case PP_TOKEN_HEADER_NAME:
-			consumer.emit_header_name(token.spelling);
-			break;
-		case PP_TOKEN_IDENTIFIER:
-			consumer.emit_identifier(token.spelling);
-			break;
-		case PP_TOKEN_NUMBER:
-			consumer.emit_pp_number(token.spelling);
-			break;
-		case PP_TOKEN_CHARACTER:
-			consumer.emit_character_literal(token.spelling,
-				token.ucn_backslash_offsets);
-			break;
-		case PP_TOKEN_USER_CHARACTER:
-			consumer.emit_user_defined_character_literal(token.spelling,
-				token.ucn_backslash_offsets);
-			break;
-		case PP_TOKEN_STRING:
-			consumer.emit_string_literal(token.spelling,
-				token.ucn_backslash_offsets);
-			break;
-		case PP_TOKEN_USER_STRING:
-			consumer.emit_user_defined_string_literal(token.spelling,
-				token.ucn_backslash_offsets);
-			break;
-		case PP_TOKEN_PUNCTUATOR:
-			consumer.emit_preprocessing_op_or_punc(token.spelling);
-			break;
-		case PP_TOKEN_OTHER:
-			consumer.emit_non_whitespace_char(token.spelling);
-			break;
-		case PP_TOKEN_EOF:
-			break;
-		}
+	case PP_TOKEN_WHITESPACE:
+		impl_->consumer.emit_whitespace_sequence();
+		break;
+	case PP_TOKEN_NEWLINE:
+		impl_->consumer.emit_new_line();
+		break;
+	case PP_TOKEN_HEADER_NAME:
+		impl_->consumer.emit_header_name(token.spelling);
+		break;
+	case PP_TOKEN_IDENTIFIER:
+		if (token.identifier_spelling)
+			impl_->consumer.emit_identifier(*token.identifier_spelling);
+		else
+			impl_->consumer.emit_non_whitespace_char(token.spelling);
+		break;
+	case PP_TOKEN_NUMBER:
+		impl_->consumer.emit_pp_number(token.spelling);
+		break;
+	case PP_TOKEN_CHARACTER:
+		impl_->consumer.emit_character_literal(token.spelling,
+			token.ucn_backslash_offsets);
+		break;
+	case PP_TOKEN_USER_CHARACTER:
+		impl_->consumer.emit_user_defined_character_literal(token.spelling,
+			token.ucn_backslash_offsets);
+		break;
+	case PP_TOKEN_STRING:
+		impl_->consumer.emit_string_literal(token.spelling,
+			token.ucn_backslash_offsets);
+		break;
+	case PP_TOKEN_USER_STRING:
+		impl_->consumer.emit_user_defined_string_literal(token.spelling,
+			token.ucn_backslash_offsets);
+		break;
+	case PP_TOKEN_PUNCTUATOR:
+		impl_->consumer.emit_preprocessing_op_or_punc(token.spelling);
+		break;
+	case PP_TOKEN_OTHER:
+		impl_->consumer.emit_non_whitespace_char(token.spelling);
+		break;
+	case PP_TOKEN_EOF:
+		break;
 	}
-	if (emit_eof)
-		consumer.emit_eof();
-	return consumer.isValid();
+	return impl_->consumer.isValid();
+}
+
+bool PostTokenStreamWriter::finish(bool emit_eof)
+{
+	if (emit_eof) impl_->consumer.emit_eof();
+	return impl_->consumer.isValid();
 }
 
 namespace

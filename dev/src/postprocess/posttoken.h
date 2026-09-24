@@ -17,6 +17,24 @@ bool PostTokenizePreprocessingTokens(
 	const std::vector<PreprocessingToken>& tokens, std::ostream& output,
 	bool emit_eof);
 
+// Stateful PA2 view for an incrementally produced phase-4 token stream.
+class PostTokenStreamWriter
+{
+public:
+	explicit PostTokenStreamWriter(std::ostream& output);
+	~PostTokenStreamWriter();
+
+	bool emit(const PreprocessingToken& token);
+	bool finish(bool emit_eof);
+
+private:
+	class Impl;
+	Impl* impl_;
+
+	PostTokenStreamWriter(const PostTokenStreamWriter&);
+	PostTokenStreamWriter& operator=(const PostTokenStreamWriter&);
+};
+
 // Typed facts used by PA3 after PA2's literal grammar and type selection.
 struct PPIntegralLiteral
 {

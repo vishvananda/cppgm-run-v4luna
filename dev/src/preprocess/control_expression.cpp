@@ -687,3 +687,59 @@ void EvaluateControlExpressions(const std::string& source, std::ostream& output)
 	ExpressionLine line(output);
 	TokenizePreprocessingSource(source, line);
 }
+
+void EvaluateControlExpressionTokens(
+	const std::vector<PreprocessingToken>& tokens, std::ostream& output)
+{
+	ExpressionLine line(output);
+	for (std::size_t i = 0; i < tokens.size(); ++i)
+	{
+		const PreprocessingToken& token = tokens[i];
+		switch (token.kind)
+		{
+		case PP_TOKEN_WHITESPACE:
+			line.emit_whitespace_sequence();
+			break;
+		case PP_TOKEN_NEWLINE:
+			line.emit_new_line();
+			break;
+		case PP_TOKEN_HEADER_NAME:
+			line.emit_header_name(token.spelling);
+			break;
+		case PP_TOKEN_IDENTIFIER:
+			if (token.identifier_spelling)
+				line.emit_identifier(*token.identifier_spelling);
+			else
+				line.emit_non_whitespace_char(token.spelling);
+			break;
+		case PP_TOKEN_NUMBER:
+			line.emit_pp_number(token.spelling);
+			break;
+		case PP_TOKEN_CHARACTER:
+			line.emit_character_literal(token.spelling,
+				token.ucn_backslash_offsets);
+			break;
+		case PP_TOKEN_USER_CHARACTER:
+			line.emit_user_defined_character_literal(token.spelling,
+				token.ucn_backslash_offsets);
+			break;
+		case PP_TOKEN_STRING:
+			line.emit_string_literal(token.spelling,
+				token.ucn_backslash_offsets);
+			break;
+		case PP_TOKEN_USER_STRING:
+			line.emit_user_defined_string_literal(token.spelling,
+				token.ucn_backslash_offsets);
+			break;
+		case PP_TOKEN_PUNCTUATOR:
+			line.emit_preprocessing_op_or_punc(token.spelling);
+			break;
+		case PP_TOKEN_OTHER:
+			line.emit_non_whitespace_char(token.spelling);
+			break;
+		case PP_TOKEN_EOF:
+			break;
+		}
+	}
+	line.emit_new_line();
+}

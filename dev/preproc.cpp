@@ -60,6 +60,20 @@ pair<string, string> BuildDateAndTime()
 		string(text + 11, 8));
 }
 
+struct PostTokenSink : IPreprocessedTokenSink
+{
+	explicit PostTokenSink(PostTokenStreamWriter& writer)
+		: writer_(writer), success(true) {}
+
+	void emit_preprocessed_token(const PreprocessingToken& token)
+	{
+		if (success) success = writer_.emit(token);
+	}
+
+	PostTokenStreamWriter& writer_;
+	bool success;
+};
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -82,12 +96,13 @@ int main(int argc, char** argv)
 		{
 			const string path = argv[i];
 			const string source = ReadFile(path);
-			PreprocessedTranslationUnit translation_unit;
-			PreprocessTranslationUnit(source, path, translation_unit,
-				build.first, build.second);
 			output_file << "sof " << path << '\n';
-			if (!PostTokenizePreprocessingTokens(translation_unit.tokens,
-				output_file, true))
+			PostTokenStreamWriter writer(output_file);
+			PostTokenSink sink(writer);
+			PreprocessingMetadata metadata;
+			PreprocessTranslationUnit(source, path, sink, metadata,
+				build.first, build.second);
+			if (!sink.success || !writer.finish(true))
 				return EXIT_FAILURE;
 			if (!output_file) throw runtime_error("failed to write preprocessor output");
 		}

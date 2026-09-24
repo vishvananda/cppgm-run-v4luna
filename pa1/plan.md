@@ -191,10 +191,11 @@ PA1.
   justified reference corrections.
 - `IPPTokenStream` documents that spelling references are callback-borrowed;
   consumers that retain a token must copy or intern it during the callback.
-  The default location hook forwards to legacy `set_source_line` overrides.
-  `rg` found no PA2–PA4 production consumer in this checkout, so this is a
-  reviewed interface contract, not an exercised integration. PA2/PA4 should
-  verify retained spelling and physical locations when they add consumers.
+  PA2 consumes spellings synchronously and retains only deferred string runs;
+  PA3 consumes them synchronously and retains compact current-line facts. Both
+  integrations were reviewed in their stage audits. The default location hook
+  still forwards to legacy `set_source_line` overrides. PA4's macro/include
+  consumer remains unaudited and must verify source locations across expansion.
 - The broader source-to-ELF declaration/template trace, semantic fact keys,
   demand invalidation, optimization budgets, executable benchmarks and backend
   allocation remain future milestone audits; PA1 has no such implementation

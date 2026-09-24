@@ -181,10 +181,14 @@ applicable.
   synchronously and copies only deferred phase-6 strings. The UCN provenance
   reducer now exercises decoded spelling plus semantic use across this
   boundary. PA2 does not consume source locations.
-- **Unaudited later consumer:** source-location callbacks and any new PA3/PA4
-  token consumers still need integration review when those stages adopt the
-  interface. ppexpr and preproc do not currently link the shared tokenizer;
-  PA2's printed token format must not become their production transport.
+- **PA2 → PA3:** audited at PA3 implementation commit `cb477870`. `ppexpr`
+  links the shared phase 1–3 tokenizer and typed literal helpers, consumes
+  borrowed spellings and UCN backslash offsets during callbacks, and does not
+  parse PA2's printed token output. PA3 ignores physical source locations.
+- **Unaudited PA4 consumer:** `preproc` remains a scaffold with no registered
+  tokenizer sources. Its macro/include integration must review source locations
+  and replace PA3's mock `defined` lookup with translation-unit macro state;
+  PA2's printed token format must not become internal transport.
 - **Later spec surfaces:** semantic graph, lookup, templates, demand,
   source-to-LowIR, optimization, MIR, allocation and ELF remain owned by their
   later milestones; PA2 has no implementation surface for them.

@@ -152,4 +152,45 @@ void ParserNameState::append_class_base(const std::string& owner, const std::str
   class_bases[owner].push_back(base);
 }
 
+bool ParserNameState::has_qualified_type_leaf(const std::string& leaf,
+                                              bool namespace_root) const
+{
+  if (!namespace_root || leaf.empty()) return false;
+  const std::string suffix = "::" + leaf;
+  for (std::unordered_map<std::string, NameKind>::const_iterator q = qualified_names.begin();
+       q != qualified_names.end(); ++q) {
+    if (q->second != TypeNameKind && q->second != TemplateNameKind) continue;
+    if (q->first.size() >= suffix.size() &&
+        q->first.compare(q->first.size() - suffix.size(), suffix.size(), suffix) == 0) return true;
+  }
+  return false;
+}
+
+void ScanTypedefDeclarationNames(const std::vector<ast_tokens::Token>& tokens,
+                                 std::size_t begin,
+                                 std::vector<std::size_t>& names,
+                                 std::size_t& end,
+                                 const std::function<bool(std::size_t)>& ensure_token)
+{
+  const std::size_t none = static_cast<std::size_t>(-1);
+  std::size_t candidate = none;
+  int parens = 0, brackets = 0, braces = 0;
+  end = tokens.size();
+  for (std::size_t cursor = begin; ensure_token(cursor); ++cursor) {
+    const std::string& part = tokens[cursor].text.get();
+    if (part == "(") ++parens;
+    else if (part == ")" && parens) --parens;
+    else if (part == "[") ++brackets;
+    else if (part == "]" && brackets) --brackets;
+    else if (part == "{") ++braces;
+    else if (part == "}" && braces) --braces;
+    if (tokens[cursor].category == ast_tokens::IdentifierToken) candidate = cursor;
+    if (parens || brackets || braces || (part != "," && part != ";")) continue;
+    if (candidate != none) names.push_back(candidate);
+    candidate = none;
+    if (part == ";") { end = cursor; return; }
+    end = cursor;
+  }
+}
+
 }  // namespace cppgm

@@ -500,12 +500,17 @@ private:
     }
     std::unordered_map<std::string, std::unordered_map<NameId, NameKind> >::const_iterator members =
         names_.class_members.find(class_lookup_key(prefix));
-    if (members == names_.class_members.end()) return false;
     const NameId leaf_id = ast_.find_name(leaf);
     if (leaf_id == none) return false;
-    std::unordered_map<NameId, NameKind>::const_iterator member = members->second.find(leaf_id);
-    return member != members->second.end() &&
-        (member->second == TypeNameKind || member->second == TemplateNameKind);
+    if (members != names_.class_members.end()) {
+      std::unordered_map<NameId, NameKind>::const_iterator member = members->second.find(leaf_id);
+      if (member != members->second.end() &&
+          (member->second == TypeNameKind || member->second == TemplateNameKind)) return true;
+    }
+    const std::string root = normalized.substr(0, normalized.find("::"));
+    const NameKind root_kind = lookup_name(root);
+    return names_.has_qualified_type_leaf(leaf, root_kind == NamespaceNameKind ||
+        names_.namespace_aliases.find(root) != names_.namespace_aliases.end());
   }
   bool template_id_followed_by_scope() const
   {
@@ -918,7 +923,8 @@ private:
       namespace_path_.push_back(tokens_[name].text);
       namespace_inline_.push_back(inline_namespace);
     }
-    names_.scopes.push_back(std::unordered_map<NameId, NameKind>());
+    const bool owns_name_scope = name != none;
+    if (owns_name_scope) names_.scopes.push_back(std::unordered_map<NameId, NameKind>());
     if (!namespace_path_.empty()) {
       std::string current_namespace;
       for (std::size_t i = 0; i < namespace_path_.size(); ++i) {
@@ -934,7 +940,7 @@ private:
       ast_.append(ns, parse_declaration(false));
     }
     expect("}");
-    names_.scopes.pop_back();
+    if (owns_name_scope) names_.scopes.pop_back();
     if (name != none) { namespace_path_.pop_back(); namespace_inline_.pop_back(); }
     return ns;
   }
@@ -1022,10 +1028,7 @@ private:
       if (allow_function_abstract && is("(") && !looks_parameter_clause()) {
         expect("(");
         std::size_t nested = node(NNestedDeclarator);
-        while (member_pointer_operator_ahead())
-          ast_.append(nested, composite_node(NPtrOperator, parse_member_pointer_operator()));
-        while (is("*") || is("&") || is("&&"))
-          ast_.append(nested, atom_node(NPtrOperator, take()));
+        ast_.append(nested, parse_declarator(true));
         expect(")");
         ast_.append(abstract, nested);
       }
@@ -1294,7 +1297,10 @@ private:
       if (!registry_name.empty()) remember_class_bases(registry_name, bases);
     }
     if (!is("{")) {
-      if (embedded) return n;
+      if (embedded) {
+        ast_.nodes[n].kind = NClassForwardDeclaration;
+        return n;
+      }
       fail("expected class body");
     }
     expect("{");
@@ -1354,6 +1360,8 @@ private:
       else
         ast_.append(n, parse_simple_after_spec(spec));
     }
+    if (name.spelling.empty() && tokens_[key].text == "union" && is(";"))
+      ast_.nodes[n].source_end_token_index = pos_;
     names_.scopes.pop_back();
     class_context_names_.pop_back();
     class_scope_indices_.pop_back();
@@ -1406,6 +1414,16 @@ private:
       if (braces == 0 && text == "using" && has_token(i + 2) &&
           tokens_[i + 1].category == IdentifierToken && tokens_[i + 2].text == "=")
         bind_name(tokens_[i + 1], TypeNameKind);
+      if (braces == 0 && text == "typedef") {
+        std::vector<std::size_t> names;
+        std::size_t end;
+        ScanTypedefDeclarationNames(tokens_, i + 1, names, end,
+            [this](std::size_t token) { return has_token(token); });
+        for (std::size_t n = 0; n < names.size(); ++n)
+          bind_name(tokens_[names[n]], TypeNameKind);
+        if (end > i) i = end;
+        continue;
+      }
       if (text == "{") ++braces;
       else if (text == "}" && braces) --braces;
       ++i;
@@ -1468,7 +1486,12 @@ private:
   {
     std::size_t i = pos_ + 1;
     if (has_token(i) && (tokens_[i].text == "class" || tokens_[i].text == "struct")) ++i;
-    if (has_token(i) && tokens_[i].category == IdentifierToken) ++i;
+    if (has_token(i) && tokens_[i].text == "::") ++i;
+    if (has_token(i) && tokens_[i].category == IdentifierToken) {
+      ++i;
+      while (has_token(i + 1) && tokens_[i].text == "::" &&
+             tokens_[i + 1].category == IdentifierToken) i += 2;
+    }
     if (has_token(i) && tokens_[i].text == ":") {
       while (has_token(i) && tokens_[i].text != "{" && tokens_[i].text != ";") ++i;
     }
@@ -1756,15 +1779,19 @@ private:
     take();
     std::size_t key = none;
     if (is_keyword("class") || is_keyword("struct")) key = take();
+    ParsedName parsed_name;
     std::string name;
-    if (is_identifier()) name = tokens_[take()].text;
+    if (is_identifier() || is("::")) {
+      parsed_name = joined_name();
+      name = parsed_name.spelling;
+    }
     std::size_t n = node(NEnumSpecifier);
     if (!name.empty()) {
       ast_.composite_atoms.push_back(name);
       ast_.nodes[n].composite = ast_.composite_atoms.size() - 1;
     }
     if (key != none) ast_.append(n, atom_node(NEnumKey, key));
-    if (!name.empty()) bind_name(name, TypeNameKind);
+    if (!name.empty() && name.find("::") == std::string::npos) bind_name(name, TypeNameKind);
     if (consume(":")) ast_.append(n, parse_type_id());
     if (!is("{")) {
       (void)embedded;

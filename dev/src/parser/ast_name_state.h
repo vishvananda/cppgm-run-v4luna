@@ -1,6 +1,9 @@
 #pragma once
 
+#include "parser/ast_tokens.h"
+
 #include <cstddef>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -24,6 +27,7 @@ public:
   void set_class_member(const std::string& owner, NameId key, NameKind value);
   void set_type_alias(const std::string& key, const std::string& value);
   void append_class_base(const std::string& owner, const std::string& base);
+  bool has_qualified_type_leaf(const std::string& leaf, bool namespace_root) const;
 
   std::vector<std::unordered_map<NameId, NameKind> > scopes;
   std::unordered_map<std::string, NameKind> qualified_names;
@@ -55,5 +59,15 @@ private:
   unsigned transaction_depth_;
   std::vector<UndoEntry> undo_log_;
 };
+
+}  // namespace cppgm
+
+namespace cppgm {
+
+void ScanTypedefDeclarationNames(const std::vector<ast_tokens::Token>& tokens,
+                                 std::size_t begin,
+                                 std::vector<std::size_t>& names,
+                                 std::size_t& end,
+                                 const std::function<bool(std::size_t)>& ensure_token);
 
 }  // namespace cppgm

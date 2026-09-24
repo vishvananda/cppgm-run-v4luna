@@ -62,6 +62,7 @@ struct AstNode
   std::size_t source_file_id;
   std::size_t line;
   std::size_t column;
+  std::size_t source_end_token_index;
 };
 
 // A translation-unit-owned syntax graph. The ordinary child links form the

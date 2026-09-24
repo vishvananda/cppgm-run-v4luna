@@ -3,6 +3,7 @@
 #include "support/not_implemented.h"
 #include "support/tool_help_text.h"
 #include "parser/ast_parser.h"
+#include "semantic/pa6.h"
 
 #include <cstdlib>
 #include <fstream>
@@ -444,7 +445,18 @@ int run_emit_ast_mode(const vector<string> & args)
 int run_emit_types_mode(const vector<string> & args)
 {
   parse_source_output_invocation(args, false);
-  return run_unimplemented_mode("--emit-types", "PA6");
+  string output;
+  vector<string> inputs;
+  for(size_t i = 0; i < args.size(); ++i) {
+    if(args[i] == "-o") {
+      if(i + 1 >= args.size()) throw logic_error("missing output file after -o");
+      output = args[++i];
+    } else {
+      inputs.push_back(args[i]);
+    }
+  }
+  cppgm::EmitTypes(inputs, output);
+  return EXIT_SUCCESS;
 }
 
 int run_emit_semantics_mode(const vector<string> & args)

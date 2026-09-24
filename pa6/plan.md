@@ -1,40 +1,51 @@
 # PA6 implementation plan
 
 Stage base commit: `e15a00e9836207e440b41055ce898f6cbaa41a6e`
-Last reviewed commit: `e15a00e9836207e440b41055ce898f6cbaa41a6e`
+Last reviewed commit: `94a042c6`
 
-## Design and spec alignment
+## Design and completed groups
 
-Build a translation-unit-local semantic graph from the structured PA5 AST;
-retain AST node identities for source declarations, and use canonical type,
-scope, entity, and binding identities rather than rendered strings. Extend the
-shared graph so PA7 can consume it. Keep deterministic rendering at the edge.
-Required behavior and boundaries are defined by `README.md` and
-`scopes-and-types.md`; production data flow and compact identity follow
-`../spec.md` sections 1–3 and 8–9.
+Build a translation-unit-local semantic graph over the PA5 AST. Keep AST node
+identities for source declarations and use canonical type, scope, entity, and
+binding identities; keep rendered output at the boundary so PA7 can extend the
+graph. The PA6 handout and `scopes-and-types.md` define behavior; `spec.md`
+sections 1–3 and 8–9 define the architecture and performance evidence.
 
-## Behavior groups and evidence
-
-| Group | Owner and data flow | Complexity target | Validation |
+| Group | Owner and data flow | Complexity target | Status |
 | --- | --- | --- | --- |
-| Scope/declaration graph, namespaces/classes/enums/templates, lookup and using edges | PA6 analyzer: AST declarations -> indexed scopes/entities/bindings -> dump | O(AST nodes + lookup candidates + edges) | `100-*`, class/namespace/using spec and general fixtures |
-| Canonical types, declarators, aliases, matching, parameter adjustment and array completion | Type builder owned by analyzer; recursive AST declarators -> canonical IDs -> declaration facts | O(declarator nodes + type operands), average O(1) intern/lookups | `200-*` type/declarator/array fixtures |
-| Integral constants, bounds, enumerators, `sizeof`/`alignof`, `decltype`, assertions | Constant/type-expression evaluator over existing AST and type facts | O(expression nodes evaluated), short circuit unselected operands | focused `200-*` and `300-*` cases |
-| Dump integration and translation-unit isolation | `cppgm++ --emit-types` driver invokes analyzer once per input and writes ordered units | O(output size) | full `make test-pa6`, multi-file fixtures |
+| Scope graph, namespaces/classes/enums/templates, lookup and using edges | PA6 analyzer: AST declarations -> indexed scopes/entities/bindings -> dump | O(AST nodes + lookup candidates + edges); average O(1) indexed lookup | Complete; namespace, inline namespace, alias, and shadowing tests pass |
+| Canonical types, declarators, aliases, matching, parameter adjustment, arrays | Type builder: recursive declarator AST -> canonical IDs -> declaration facts | O(declarator nodes + type operands), average O(1) interning | Complete; declarator, array, reference, and function tests pass |
+| Integral constants, bounds, enumerators, `sizeof`/`alignof`, `decltype`, assertions | Evaluator over existing AST and semantic facts | O(expression nodes evaluated); short-circuit unselected operands | Complete; constant and assertion tests pass |
+| Dump integration and translation-unit isolation | `cppgm++ --emit-types` invokes the analyzer once per input | O(output size) after analysis | Complete; full PA6 suite passes |
 
-Performance evidence: measure PA6 compiler wall time and peak RSS on a small,
-medium, and largest checked-in valid input after the mode works; retain the
-commands and results here. PA6 emits no executable, so runtime and text-size
-evidence are not applicable. This stage adds no code optimization; its
-acceptance is linear source/graph work with indexed lookup and bounded memory
-proportional to AST plus semantic facts. No inherited optimization gate applies.
+## Performance evidence
+
+Measured 2026-09-24 with 30 sequential fresh invocations per input using
+`dev/cppgm++ --emit-types -o /dev/null <input>` under GNU `/usr/bin/time`.
+
+| Input | Bytes | Total wall time / 30 | Mean per invocation | Peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| `general/100-class-forward.t` | 16 | 0.10 s | 3.3 ms | 4,872 KB |
+| `general/200-inline-namespace-alias-lookup.t` | 199 | 0.11 s | 3.7 ms | 4,968 KB |
+| `general/300-declaration-forms-valid.t` (largest valid fixture) | 1,749 | 0.13 s | 4.3 ms | 4,936 KB |
+
+PA6 emits a semantic dump, not an executable, so runtime and text size are not
+applicable. No optimization or performance improvement is claimed. PA6 has no
+numeric latency/RSS cap; acceptance is indexed, source-graph-sized work and
+storage. Executable runtime and code-growth gates belong to later stages that
+emit programs.
 
 ## Handoff ledger
 
-- Implementation remaining: resolve whole PA6 behavior groups above, then run
-  PA6, prior-through, and file-audit checks without reducing fixture coverage.
-- Independent review: verify semantic construction remains a reusable graph
-  over AST source identities, and review C++11 interpretation/reference
-  fixtures; no review question waives required behavior.
-- Handoff boundary: only after required checks pass and the worktree is
-  committed and clean; assignment completion remains subject to Ralph audit.
+- Remaining required implementation groups: none identified against the PA6
+  contract. Coverage is unchanged; no reference files were modified.
+- Validation: `make test-pa6` 105/105; `make test-report-through-pa6`
+  498/498; `perl scripts/cppgm_file_audit.pl --stage pa6 --paths dev/src`
+  passed (34 files).
+- Independent audit questions: review namespace/tag hiding interactions and
+  the qualified enum output view as PA7 consumes these identities; confirm the
+  anonymous-union token extent remains separate from source locations. These
+  are review questions, not waived requirements.
+- Implementation commit: `94a042c6` (`Implement PA6 semantic scopes and types`).
+  Handoff requires this plan update committed and a clean worktree; PA6 passes,
+  subject to the stage audit.

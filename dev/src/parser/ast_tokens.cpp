@@ -63,6 +63,18 @@ const std::unordered_map<std::string, std::string>& punctuator_tags()
   return tags;
 }
 
+const std::string& identifier_tag()
+{
+  static const std::string value = "TT_IDENTIFIER";
+  return value;
+}
+
+const std::string& literal_tag()
+{
+  static const std::string value = "TT_LITERAL";
+  return value;
+}
+
 }  // namespace
 
 bool IsKeyword(const std::string& spelling)
@@ -70,17 +82,21 @@ bool IsKeyword(const std::string& spelling)
   return keyword_tags().find(spelling) != keyword_tags().end();
 }
 
-Token MakeToken(const PreprocessingToken& pp)
+Token MakeToken(const PreprocessingToken& pp, const std::string* stable_spelling)
 {
+  if (!stable_spelling) throw std::runtime_error("token spelling has no owner");
   Token token;
-  token.text = pp.identifier_spelling ? *pp.identifier_spelling : pp.spelling;
+  token.text = TokenText(*stable_spelling);
+  token.identifier_id = pp.identifier_id;
   token.line = pp.line;
   token.column = pp.column;
+  token.source_file_id = pp.source_file_id;
+  const std::string& spelling = *stable_spelling;
   if (pp.kind == PP_TOKEN_IDENTIFIER) {
     const std::unordered_map<std::string, std::string>::const_iterator keyword =
-        keyword_tags().find(token.text);
+        keyword_tags().find(spelling);
     const std::unordered_map<std::string, std::string>::const_iterator punct =
-        punctuator_tags().find(token.text);
+        punctuator_tags().find(spelling);
     if (punct != punctuator_tags().end()) {
       token.category = PunctuatorToken;
       token.tag = punct->second;
@@ -89,18 +105,18 @@ Token MakeToken(const PreprocessingToken& pp)
       token.tag = keyword->second;
     } else {
       token.category = IdentifierToken;
-      token.tag = "TT_IDENTIFIER";
+      token.tag = identifier_tag();
     }
   } else if (pp.kind == PP_TOKEN_PUNCTUATOR) {
     const std::unordered_map<std::string, std::string>::const_iterator keyword =
-        keyword_tags().find(token.text);
+        keyword_tags().find(spelling);
     if (keyword != keyword_tags().end()) {
       token.category = KeywordToken;
       token.tag = keyword->second;
     } else {
       token.category = PunctuatorToken;
       const std::unordered_map<std::string, std::string>::const_iterator found =
-          punctuator_tags().find(token.text);
+          punctuator_tags().find(spelling);
       if (found == punctuator_tags().end())
         throw std::runtime_error("invalid C++ punctuator");
       token.tag = found->second;
@@ -109,7 +125,7 @@ Token MakeToken(const PreprocessingToken& pp)
              pp.kind == PP_TOKEN_USER_CHARACTER || pp.kind == PP_TOKEN_STRING ||
              pp.kind == PP_TOKEN_USER_STRING) {
     token.category = LiteralToken;
-    token.tag = "TT_LITERAL";
+    token.tag = literal_tag();
   } else {
     throw std::runtime_error("invalid token in C++ source");
   }

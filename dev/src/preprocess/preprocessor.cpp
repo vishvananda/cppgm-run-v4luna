@@ -5,17 +5,21 @@
 #include <algorithm>
 #include <cctype>
 #include <climits>
+#include <condition_variable>
 #include <cstdint>
 #include <ctime>
 #include <deque>
+#include <exception>
 #include <fstream>
 #include <functional>
 #include <iterator>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 
@@ -1933,3 +1937,127 @@ bool PreprocessTranslationUnit(const std::string& source, const std::string& pat
 	preprocessor.process(source, path, output, metadata);
 	return true;
 }
+
+namespace
+{
+struct CursorCancelled {};
+}
+
+struct PreprocessedTokenCursor::Impl : IPreprocessedTokenSink
+{
+	Impl(const std::string& source, const std::string& path,
+		PreprocessingMetadata& metadata, const std::string& build_date,
+		const std::string& build_time)
+		: source(source), path(path), metadata(metadata), build_date(build_date),
+		  build_time(build_time), write_buffer(make_batch()), published(make_batch()),
+		  read_index(0), cancelled(false), finished(false),
+		  worker(&Impl::run, this)
+	{}
+
+	~Impl()
+	{
+		{
+			std::lock_guard<std::mutex> lock(mutex);
+			cancelled = true;
+		}
+		ready.notify_all();
+		space.notify_all();
+		if (worker.joinable()) worker.join();
+	}
+
+	void emit_preprocessed_token(const PreprocessingToken& token)
+	{
+		write_buffer.push_back(token);
+		if (write_buffer.size() == capacity) publish_buffer();
+	}
+
+	bool next(PreprocessingToken& token)
+	{
+		std::unique_lock<std::mutex> lock(mutex);
+		ready.wait(lock, [this]() { return !published.empty() || finished; });
+		if (!published.empty()) {
+			token = std::move(published[read_index++]);
+			if (read_index == published.size()) {
+				published.clear();
+				read_index = 0;
+				lock.unlock();
+				space.notify_one();
+			}
+			return true;
+		}
+		const std::exception_ptr failure = error;
+		lock.unlock();
+		if (failure) std::rethrow_exception(failure);
+		return false;
+	}
+
+	void run()
+	{
+		std::exception_ptr failure;
+		try {
+			PreprocessTranslationUnit(source, path, *this, metadata,
+				build_date, build_time);
+		} catch (const CursorCancelled&) {
+		} catch (...) {
+			failure = std::current_exception();
+		}
+		try {
+			publish_buffer();
+		} catch (const CursorCancelled&) {
+		}
+		{
+			std::lock_guard<std::mutex> lock(mutex);
+			if (failure && !cancelled) error = failure;
+			finished = true;
+		}
+		ready.notify_all();
+		space.notify_all();
+	}
+
+	static std::vector<PreprocessingToken> make_batch()
+	{
+		std::vector<PreprocessingToken> batch;
+		batch.reserve(capacity);
+		return batch;
+	}
+
+	void publish_buffer()
+	{
+		if (write_buffer.empty()) return;
+		std::unique_lock<std::mutex> lock(mutex);
+		space.wait(lock, [this]() { return cancelled || published.empty(); });
+		if (cancelled) throw CursorCancelled();
+		published.swap(write_buffer);
+		read_index = 0;
+		lock.unlock();
+		ready.notify_one();
+	}
+
+	static const std::size_t capacity = 128;
+	const std::string& source;
+	const std::string& path;
+	PreprocessingMetadata& metadata;
+	const std::string& build_date;
+	const std::string& build_time;
+	std::mutex mutex;
+	std::condition_variable ready;
+	std::condition_variable space;
+	std::vector<PreprocessingToken> write_buffer;
+	std::vector<PreprocessingToken> published;
+	std::size_t read_index;
+	std::exception_ptr error;
+	bool cancelled;
+	bool finished;
+	std::thread worker;
+};
+
+PreprocessedTokenCursor::PreprocessedTokenCursor(const std::string& source,
+	const std::string& path, PreprocessingMetadata& metadata,
+	const std::string& build_date, const std::string& build_time)
+	: impl_(new Impl(source, path, metadata, build_date, build_time))
+{}
+
+PreprocessedTokenCursor::~PreprocessedTokenCursor() { delete impl_; }
+
+bool PreprocessedTokenCursor::next(PreprocessingToken& token)
+{ return impl_->next(token); }

@@ -32,7 +32,7 @@ Q = $(if $(filter 1,$(V)),,@)
 quiet = @if [ "$(V)" != "1" ]; then printf '  %-7s %s\n' '$(1)' '$(2)'; fi
 CPPGM_TEST_RUNNER ?= 1
 CPPGM_STDLIB_FLAGS ?=
-CC_FLAGS ?= -std=gnu++11 -Wall -O3 $(CPPGM_STDLIB_FLAGS)
+CC_FLAGS ?= -std=gnu++11 -Wall -O3 -pthread $(CPPGM_STDLIB_FLAGS)
 TEST_RUNNER_SHARED_FLAGS = $(if $(filter 1,$(CPPGM_TEST_RUNNER)),-DTEST_RUNNER_ENABLE,)
 TEST_RUNNER_ENTRY_FLAGS = $(if $(filter 1,$(CPPGM_TEST_RUNNER)),-Dmain=test_runner_real_main,)
 ENTRY_CC_FLAGS = $(CC_FLAGS) $(TEST_RUNNER_ENTRY_FLAGS)

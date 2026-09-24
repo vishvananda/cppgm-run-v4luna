@@ -72,6 +72,28 @@ struct IPreprocessedTokenSink
 	virtual ~IPreprocessedTokenSink() {}
 };
 
+// Pull adapter for the streaming preprocessor. The source and metadata must
+// outlive the cursor. The implementation bounds producer lookahead while
+// keeping macro/include state inside one translation unit.
+class PreprocessedTokenCursor
+{
+public:
+	PreprocessedTokenCursor(const std::string& source, const std::string& path,
+		PreprocessingMetadata& metadata, const std::string& build_date,
+		const std::string& build_time);
+	~PreprocessedTokenCursor();
+	PreprocessedTokenCursor(const PreprocessedTokenCursor&) = delete;
+	PreprocessedTokenCursor& operator=(const PreprocessedTokenCursor&) = delete;
+
+	// Returns false at end of the primary translation unit; preprocessing
+	// failures are rethrown after all already-produced tokens are consumed.
+	bool next(PreprocessingToken& token);
+
+private:
+	struct Impl;
+	Impl* impl_;
+};
+
 // Preprocess one primary source and all of its includes into a streaming
 // token consumer. Macro, conditional, and pragma-once state is fresh for each
 // call. The call resets metadata, so it must be dedicated to this translation

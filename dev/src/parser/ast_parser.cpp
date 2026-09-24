@@ -10,9 +10,11 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <sys/stat.h>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -29,6 +31,7 @@ bool GetPreprocessorFileId(const std::string& path,
 }
 
 namespace cppgm {
+
 namespace {
 
 using ast_tokens::IdentifierToken;
@@ -38,261 +41,90 @@ using ast_tokens::LiteralToken;
 using ast_tokens::MakeToken;
 using ast_tokens::PunctuatorToken;
 using ast_tokens::Token;
+using ast_tokens::TokenText;
 
 const std::size_t none = static_cast<std::size_t>(-1);
 
-struct TokenSink : IPreprocessedTokenSink
-{
-  explicit TokenSink(std::vector<Token>& out) : tokens(out), valid(true) {}
-  void emit_preprocessed_token(const PreprocessingToken& pp)
-  {
-    if (pp.kind == PP_TOKEN_WHITESPACE || pp.kind == PP_TOKEN_NEWLINE ||
-        pp.kind == PP_TOKEN_EOF || pp.kind == PP_TOKEN_HEADER_NAME)
-      return;
-    try { tokens.push_back(MakeToken(pp)); }
-    catch (const std::exception& e) { valid = false; failure = e.what() + std::string(" near '") +
-        (pp.identifier_spelling ? *pp.identifier_spelling : pp.spelling) + "'"; }
-  }
-  std::vector<Token>& tokens;
-  bool valid;
-  std::string failure;
-};
-
-enum NodeKind
-{
-  NTranslationUnit, NEmptyDeclaration, NSimpleDeclaration, NFunctionDefinition,
-  NDeclSpecifierSeq, NDeclSpecifier, NInitDeclaratorList, NInitDeclarator,
-  NDeclarator, NIdentifier, NIdExpression, NParameterClause, NParameterDeclaration,
-  NInitializer, NCompoundStatement, NExpressionStatement, NLiteral, NKeywordLiteral,
-  NBinaryExpression, NAssignmentExpression, NConditionalExpression, NUnaryExpression,
-  NPostfixExpression, NParenthesizedExpression, NCallExpression, NArgumentList,
-  NSubscriptExpression, NMemberExpression, NReturnStatement, NIfStatement,
-  NCondition, NThen, NElse, NWhileStatement, NForStatement, NForInitStatement,
-  NIteration, NBreakStatement, NContinueStatement, NGotoStatement, NThrowStatement,
-  NParenInitializer, NBracedInitList, NPtrOperator, NCvQualifier, NArraySuffix,
-  NNestedDeclarator, NParameterPack, NStaticAssertDeclaration, NMessage,
-  NNamespaceDefinition, NUsingDirective, NUsingDeclaration, NAliasDeclaration,
-  NTarget, NTypeId, NTypeSpecifierSeq, NTypeName, NSizeofExpression,
-  NTemplateDeclaration, NTemplateParameterClause, NTemplateParameterList,
-  NTypeParameter, NNonTypeTemplateParameter, NParameterKey, NDefaultTemplateArgument,
-  NClassSpecifier, NClassForwardDeclaration, NClassKey, NBaseClause, NBaseSpecifier,
-  NBaseName, NAccessSpecifier, NEnumSpecifier, NEnumKey, NEnumerator,
-  NBitFieldDeclaration, NBitFieldDeclarator, NInlineMarker, NTypeSpecifier,
-  NNamespaceAliasDefinition, NSpecialMemberDeclaration, NSpecialMemberDefinition,
-  NCtorInitializer, NMemInitializer, NMemInitializerId, NParenArgumentList,
-  NVirtualBase, NSpecialInitializer, NAbstractDeclarator, NCastExpression,
-  NTypeTraitExpression, NNewExpression, NDeleteExpression, NGlobalScope,
-  NArrayDelete, NLambdaExpression, NLambdaIntroducer, NLambdaDeclarator,
-  NTrailingReturnType, NRangeForStatement, NRangeDeclaration, NRangeInitializer,
-  NSwitchStatement, NCaseStatement, NDefaultStatement, NDoStatement, NTryBlock,
-  NHandler, NExceptionDeclaration, NEllipsis, NLabeledStatement,
-  NNoexceptSpecification, NLambdaSpecifier, NFunctionQualifier, NRefQualifier,
-  NVirtSpecifier, NDefaultArgument, NSizeofPackExpression, NTemplateTemplateParameter,
-  NConditionDeclaration, NLinkageSpecification, NDecltypeSpecifier
-  , NExplicitInstantiation, NFunctionTryBlock, NMemberSpecifiers, NSpecifier,
-  NPlacement, NPackExpansionExpression, NPackExpansion, NTaggedLiteral
-};
-
-const char* NodeName(NodeKind kind)
-{
-  switch (kind) {
-  case NTranslationUnit: return "translation-unit";
-  case NEmptyDeclaration: return "empty-declaration";
-  case NSimpleDeclaration: return "simple-declaration";
-  case NFunctionDefinition: return "function-definition";
-  case NDeclSpecifierSeq: return "decl-specifier-seq";
-  case NDeclSpecifier: return "decl-specifier";
-  case NInitDeclaratorList: return "init-declarator-list";
-  case NInitDeclarator: return "init-declarator";
-  case NDeclarator: return "declarator";
-  case NIdentifier: return "identifier";
-  case NIdExpression: return "id-expression";
-  case NParameterClause: return "parameter-clause";
-  case NParameterDeclaration: return "parameter-declaration";
-  case NInitializer: return "initializer";
-  case NCompoundStatement: return "compound-statement";
-  case NExpressionStatement: return "expression-statement";
-  case NLiteral: return "literal";
-  case NTaggedLiteral: return "literal";
-  case NKeywordLiteral: return "keyword-literal";
-  case NBinaryExpression: return "binary-expression";
-  case NAssignmentExpression: return "assignment-expression";
-  case NConditionalExpression: return "conditional-expression";
-  case NUnaryExpression: return "unary-expression";
-  case NPostfixExpression: return "postfix-expression";
-  case NParenthesizedExpression: return "parenthesized-expression";
-  case NCallExpression: return "call-expression";
-  case NArgumentList: return "argument-list";
-  case NSubscriptExpression: return "subscript-expression";
-  case NMemberExpression: return "member-expression";
-  case NReturnStatement: return "return-statement";
-  case NIfStatement: return "if-statement";
-  case NCondition: return "condition";
-  case NConditionDeclaration: return "condition-declaration";
-  case NThen: return "then";
-  case NElse: return "else";
-  case NWhileStatement: return "while-statement";
-  case NForStatement: return "for-statement";
-  case NForInitStatement: return "for-init-statement";
-  case NIteration: return "iteration";
-  case NBreakStatement: return "break-statement";
-  case NContinueStatement: return "continue-statement";
-  case NGotoStatement: return "goto-statement";
-  case NThrowStatement: return "throw-statement";
-  case NParenInitializer: return "paren-initializer";
-  case NBracedInitList: return "braced-init-list";
-  case NPtrOperator: return "ptr-operator";
-  case NCvQualifier: return "cv-qualifier";
-  case NArraySuffix: return "array-suffix";
-  case NNestedDeclarator: return "nested-declarator";
-  case NParameterPack: return "parameter-pack";
-  case NStaticAssertDeclaration: return "static-assert-declaration";
-  case NMessage: return "message";
-  case NNamespaceDefinition: return "namespace-definition";
-  case NUsingDirective: return "using-directive";
-  case NUsingDeclaration: return "using-declaration";
-  case NAliasDeclaration: return "alias-declaration";
-  case NTarget: return "target";
-  case NTypeId: return "type-id";
-  case NTypeSpecifierSeq: return "type-specifier-seq";
-  case NTypeName: return "type-name";
-  case NSizeofExpression: return "sizeof-expression";
-  case NSizeofPackExpression: return "sizeof-pack-expression";
-  case NTemplateTemplateParameter: return "template-template-parameter";
-  case NTemplateDeclaration: return "template-declaration";
-  case NTemplateParameterClause: return "template-parameter-clause";
-  case NTemplateParameterList: return "template-parameter-list";
-  case NTypeParameter: return "type-parameter";
-  case NNonTypeTemplateParameter: return "non-type-template-parameter";
-  case NParameterKey: return "parameter-key";
-  case NDefaultTemplateArgument: return "default-template-argument";
-  case NClassSpecifier: return "class-specifier";
-  case NClassForwardDeclaration: return "class-forward-declaration";
-  case NClassKey: return "class-key";
-  case NBaseClause: return "base-clause";
-  case NBaseSpecifier: return "base-specifier";
-  case NBaseName: return "base-name";
-  case NAccessSpecifier: return "access-specifier";
-  case NEnumSpecifier: return "enum-specifier";
-  case NEnumKey: return "enum-key";
-  case NEnumerator: return "enumerator";
-  case NBitFieldDeclaration: return "bit-field-declaration";
-  case NBitFieldDeclarator: return "bit-field-declarator";
-  case NInlineMarker: return "inline";
-  case NTypeSpecifier: return "type-specifier";
-  case NNamespaceAliasDefinition: return "namespace-alias-definition";
-  case NSpecialMemberDeclaration: return "special-member-declaration";
-  case NSpecialMemberDefinition: return "special-member-definition";
-  case NCtorInitializer: return "ctor-initializer";
-  case NMemInitializer: return "mem-initializer";
-  case NMemInitializerId: return "mem-initializer-id";
-  case NParenArgumentList: return "paren-argument-list";
-  case NVirtualBase: return "virtual";
-  case NSpecialInitializer: return "special-initializer";
-  case NAbstractDeclarator: return "abstract-declarator";
-  case NCastExpression: return "cast-expression";
-  case NTypeTraitExpression: return "type-trait-expression";
-  case NNewExpression: return "new-expression";
-  case NDeleteExpression: return "delete-expression";
-  case NGlobalScope: return "global-scope";
-  case NArrayDelete: return "array-delete";
-  case NLambdaExpression: return "lambda-expression";
-  case NLambdaIntroducer: return "lambda-introducer";
-  case NLambdaDeclarator: return "lambda-declarator";
-  case NTrailingReturnType: return "trailing-return-type";
-  case NRangeForStatement: return "range-for-statement";
-  case NRangeDeclaration: return "range-declaration";
-  case NRangeInitializer: return "range-initializer";
-  case NSwitchStatement: return "switch-statement";
-  case NCaseStatement: return "case-statement";
-  case NDefaultStatement: return "default-statement";
-  case NDoStatement: return "do-statement";
-  case NTryBlock: return "try-block";
-  case NHandler: return "handler";
-  case NExceptionDeclaration: return "exception-declaration";
-  case NEllipsis: return "ellipsis";
-  case NLabeledStatement: return "labeled-statement";
-  case NNoexceptSpecification: return "noexcept-specification";
-  case NLambdaSpecifier: return "lambda-specifier";
-  case NFunctionQualifier: return "function-qualifier";
-  case NRefQualifier: return "ref-qualifier";
-  case NVirtSpecifier: return "virt-specifier";
-  case NDefaultArgument: return "default-argument";
-  case NLinkageSpecification: return "linkage-specification";
-  case NDecltypeSpecifier: return "decltype-specifier";
-  case NPlacement: return "placement";
-  case NPackExpansionExpression: return "pack-expansion-expression";
-  case NPackExpansion: return "pack-expansion";
-  case NExplicitInstantiation: return "explicit-instantiation-declaration";
-  case NFunctionTryBlock: return "function-try-block";
-  case NMemberSpecifiers: return "member-specifiers";
-  case NSpecifier: return "specifier";
-  }
-  return "syntax-node";
-}
-
-struct AstNode
-{
-  NodeKind kind;
-  std::size_t atom;
-  std::size_t composite;
-  std::size_t first_child;
-  std::size_t last_child;
-  std::size_t next_sibling;
-};
-
-struct Ast
-{
-  explicit Ast(std::vector<Token>&& t) : tokens(std::move(t)) {}
-  std::size_t add(NodeKind kind, std::size_t atom = none, std::size_t composite = none)
-  {
-    AstNode node;
-    node.kind = kind; node.atom = atom; node.composite = composite;
-    node.first_child = node.last_child = node.next_sibling = none;
-    nodes.push_back(node);
-    return nodes.size() - 1;
-  }
-  void append(std::size_t parent, std::size_t child)
-  {
-    if (parent == none || child == none) return;
-    if (nodes[parent].first_child == none) nodes[parent].first_child = child;
-    else nodes[nodes[parent].last_child].next_sibling = child;
-    nodes[parent].last_child = child;
-  }
-  std::vector<Token> tokens;
-  std::vector<AstNode> nodes;
-  std::vector<std::string> composite_atoms;
-};
 
 class Parser
 {
-public:
-  explicit Parser(std::vector<Token>&& tokens)
-      : ast_(std::move(tokens)), tokens_(ast_.tokens), pos_(0), pending_gt_(0),
-        template_non_type_default_(0)
+  struct ParsedName
   {
-    names_.scopes.push_back(std::unordered_map<std::string, NameKind>());
+    ParsedName() : first_syntax(none), last_syntax(none), last_component(none), first_token(none),
+        source_token(none), prefix_syntax(none), operator_tokens_begin(none),
+        operator_tokens_end(none), global_scope(false) {}
+    std::string spelling;
+    std::size_t first_syntax;
+    std::size_t last_syntax;
+    std::size_t last_component;
+    std::size_t first_token;
+    std::size_t source_token;
+    std::size_t prefix_syntax;
+    std::size_t operator_tokens_begin;
+    std::size_t operator_tokens_end;
+    bool global_scope;
+  };
+
+public:
+  Parser(Ast& ast, PreprocessedTokenCursor& cursor)
+      : ast_(ast), tokens_(ast.tokens), cursor_(cursor), pos_(0),
+        pending_gt_(0), template_non_type_default_(0),
+        template_expression_nesting_(0), input_finished_(false)
+  {
+    names_.scopes.push_back(std::unordered_map<NameId, NameKind>());
   }
 
   Ast Parse()
   {
-    const std::size_t root = ast_.add(NTranslationUnit);
+    const std::size_t root = node(NTranslationUnit);
     while (!at_end()) {
       const std::size_t before = pos_;
       ast_.append(root, parse_declaration(false));
       if (pos_ == before) fail("parser made no progress");
     }
+    ast_.compact_tokens();
     return std::move(ast_);
   }
 
 private:
   const Token& token(std::size_t n) const
   {
-    static const Token end = {"<eof>", "ST_EOF", PunctuatorToken, 0, 0};
-    return n < tokens_.size() ? tokens_[n] : end;
+    if (has_token(n)) return tokens_[n];
+    static const std::string end_text("<eof>");
+    static const std::string end_tag("ST_EOF");
+    static const Token end = []() {
+      Token value;
+      value.text = TokenText(end_text);
+      value.tag = TokenText(end_tag);
+      value.category = PunctuatorToken;
+      return value;
+    }();
+    return end;
+  }
+  bool has_token(std::size_t n) const
+  {
+    while (tokens_.size() <= n && !input_finished_) {
+      PreprocessingToken pp;
+      if (!cursor_.next(pp)) {
+        input_finished_ = true;
+        break;
+      }
+      if (pp.kind == PP_TOKEN_WHITESPACE || pp.kind == PP_TOKEN_NEWLINE ||
+          pp.kind == PP_TOKEN_EOF || pp.kind == PP_TOKEN_HEADER_NAME)
+        continue;
+      const std::string* spelling = pp.identifier_spelling;
+      if (pp.kind == PP_TOKEN_IDENTIFIER &&
+          (spelling == 0 || pp.identifier_id == static_cast<std::size_t>(-1)))
+        throw std::runtime_error("preprocessor emitted an uninterned identifier");
+      if (pp.kind == PP_TOKEN_IDENTIFIER)
+        ast_.register_identifier(pp.identifier_id, *spelling);
+      if (!spelling) spelling = ast_.intern_spelling(pp.spelling);
+      tokens_.push_back(MakeToken(pp, spelling));
+    }
+    return n < tokens_.size();
   }
   const Token& peek(std::size_t n = 0) const { return token(pos_ + n); }
-  bool at_end() const { return pos_ >= tokens_.size() && pending_gt_ == 0; }
+  bool at_end() const { return pending_gt_ == 0 && !has_token(pos_); }
   bool is(const std::string& s, std::size_t n = 0) const
   { return n == 0 && s == ">" && pending_gt_ ? true : peek(n).text == s; }
   bool is_tag(const std::string& s, std::size_t n = 0) const { return peek(n).tag == s; }
@@ -311,13 +143,103 @@ private:
         std::to_string(t.column) + " near '" + t.text + "'");
   }
   std::size_t node(NodeKind kind, std::size_t atom = none)
-  { return ast_.add(kind, atom); }
+  {
+    const std::size_t id = ast_.add(kind, atom);
+    if (atom != none && atom < tokens_.size()) set_node_location_from_token(id, atom);
+    else if (has_token(pos_)) set_node_location_from_token(id, pos_);
+    return id;
+  }
   std::size_t atom_node(NodeKind kind, std::size_t atom)
-  { return ast_.add(kind, atom); }
-  std::size_t composite_node(NodeKind kind, const std::string& text)
+  { return node(kind, atom); }
+  void set_node_location_from_token(std::size_t id, std::size_t token_index)
+  {
+    if (token_index >= tokens_.size()) return;
+    const Token& source = tokens_[token_index];
+    ast_.set_location(id, source.source_file_id, source.line, source.column);
+  }
+  std::size_t composite_node(NodeKind kind, const std::string& text,
+                             std::size_t source_token = none)
   {
     ast_.composite_atoms.push_back(text);
-    return ast_.add(kind, none, ast_.composite_atoms.size() - 1);
+    const std::size_t id = ast_.add(kind, none, ast_.composite_atoms.size() - 1);
+    if (source_token != none) set_node_location_from_token(id, source_token);
+    else if (has_token(pos_)) set_node_location_from_token(id, pos_);
+    return id;
+  }
+  void ensure_name_syntax(ParsedName& name)
+  {
+    if (name.first_syntax != none) return;
+    const std::size_t source_token = name.source_token != none ? name.source_token : name.first_token;
+    if (name.global_scope) {
+      const std::size_t global = node(NGlobalScope);
+      if (source_token != none) set_node_location_from_token(global, source_token);
+      append_name_syntax(name, global);
+    }
+    if (name.prefix_syntax != none) append_name_syntax(name, name.prefix_syntax);
+    if (name.first_token != none) {
+      name.last_component = node(NNameComponent, name.first_token);
+      set_node_location_from_token(name.last_component, name.first_token);
+      append_operator_name_tokens(name, name.last_component);
+      append_name_syntax(name, name.last_component);
+    } else if (name.first_token == none && name.prefix_syntax == none &&
+               !name.global_scope && !name.spelling.empty()) {
+      name.last_component = composite_node(NNameComponent, name.spelling, source_token);
+      append_name_syntax(name, name.last_component);
+    }
+  }
+  void append_name_syntax(ParsedName& name, std::size_t id)
+  {
+    if (name.first_syntax == none) name.first_syntax = name.last_syntax = id;
+    else {
+      ast_.nodes[name.last_syntax].next_aux_sibling = id;
+      name.last_syntax = id;
+    }
+  }
+  void append_operator_name_tokens(const ParsedName& name, std::size_t component)
+  {
+    if (name.operator_tokens_begin == none || name.operator_tokens_end == none ||
+        ast_.nodes[component].atom != name.operator_tokens_begin) return;
+    for (std::size_t i = name.operator_tokens_begin + 1;
+         i < name.operator_tokens_end; ++i)
+      ast_.append(component, node(NNameComponentToken, i));
+  }
+  void add_name_component(ParsedName& name, std::size_t token_index)
+  {
+    ensure_name_syntax(name);
+    const std::size_t component = node(NNameComponent, token_index);
+    set_node_location_from_token(component, token_index);
+    if (name.operator_tokens_begin == token_index)
+      append_operator_name_tokens(name, component);
+    append_name_syntax(name, component);
+    name.last_component = component;
+  }
+  std::size_t composite_node(NodeKind kind, ParsedName name)
+  {
+    if ((kind == NIdentifier || kind == NIdExpression) &&
+        name.first_token != none && name.first_token == name.source_token &&
+        !name.global_scope && name.prefix_syntax == none &&
+        name.spelling == tokens_[name.first_token].text)
+      return atom_node(kind, name.first_token);
+    ensure_name_syntax(name);
+    const std::size_t source_token = name.source_token != none ? name.source_token : name.first_token;
+    const std::size_t id = composite_node(kind, name.spelling, source_token);
+    if (name.first_syntax != none) {
+      ast_.nodes[id].first_aux_child = name.first_syntax;
+      ast_.nodes[id].last_aux_child = name.last_syntax;
+    }
+    return id;
+  }
+  void set_composite_name(std::size_t id, ParsedName& name)
+  {
+    ensure_name_syntax(name);
+    ast_.composite_atoms.push_back(name.spelling);
+    ast_.nodes[id].composite = ast_.composite_atoms.size() - 1;
+    if (name.first_syntax != none) {
+      ast_.nodes[id].first_aux_child = name.first_syntax;
+      ast_.nodes[id].last_aux_child = name.last_syntax;
+    }
+    const std::size_t source_token = name.source_token != none ? name.source_token : name.first_token;
+    if (source_token != none) set_node_location_from_token(id, source_token);
   }
   bool is_identifier(std::size_t n = 0) const { return peek(n).category == IdentifierToken; }
   bool is_literal(std::size_t n = 0) const { return peek(n).category == LiteralToken; }
@@ -356,21 +278,47 @@ private:
         if (qualified != names_.qualified_names.end()) return qualified->second;
       }
     }
+    const std::size_t id = ast_.find_name(normalized);
+    if (id == none) return UnknownName;
     for (std::size_t i = names_.scopes.size(); i != 0; --i) {
-      std::unordered_map<std::string, NameKind>::const_iterator it = names_.scopes[i - 1].find(name);
+      std::unordered_map<NameId, NameKind>::const_iterator it = names_.scopes[i - 1].find(id);
       if (it != names_.scopes[i - 1].end()) return it->second;
+    }
+    return UnknownName;
+  }
+  NameKind lookup_name(const Token& token) const
+  {
+    if (token.identifier_id == none || token.category != IdentifierToken)
+      return UnknownName;
+    for (std::size_t i = names_.scopes.size(); i != 0; --i) {
+      std::unordered_map<NameId, NameKind>::const_iterator found =
+          names_.scopes[i - 1].find(token.identifier_id);
+      if (found != names_.scopes[i - 1].end()) return found->second;
     }
     return UnknownName;
   }
   void bind_name(const std::string& name, NameKind kind)
   { bind_name_in_scope(names_.scopes.size() - 1, name, kind); }
+  void bind_name(const Token& token, NameKind kind)
+  { bind_name_in_scope(names_.scopes.size() - 1, token, kind); }
   void bind_name_in_scope(std::size_t scope, const std::string& name, NameKind kind)
   {
     if (name.empty()) return;
-    names_.set_scope_name(scope, name, kind);
+    bind_name_in_scope(scope, ast_.intern_name(name), name, kind);
+  }
+  void bind_name_in_scope(std::size_t scope, const Token& token, NameKind kind)
+  {
+    const NameId id = token.identifier_id == none ? ast_.intern_name(token.text) : token.identifier_id;
+    bind_name_in_scope(scope, id, token.text, kind);
+  }
+  void bind_name_in_scope(std::size_t scope, NameId id,
+                          const std::string& name, NameKind kind)
+  {
+    if (name.empty()) return;
+    names_.set_scope_name(scope, id, kind);
     if (!class_scope_indices_.empty() && class_scope_indices_.back() == scope) {
       const std::string key = class_lookup_key(class_context_names_.back());
-      names_.set_class_member(key, name, kind);
+      names_.set_class_member(key, id, kind);
     }
     if (namespace_path_.empty()) return;
     std::string full, visible;
@@ -433,10 +381,10 @@ private:
   {
     const std::string key = class_lookup_key(class_name);
     if (!visited.insert(key).second) return;
-    std::unordered_map<std::string, std::unordered_map<std::string, NameKind> >::const_iterator members =
+    std::unordered_map<std::string, std::unordered_map<NameId, NameKind> >::const_iterator members =
         names_.class_members.find(key);
     if (members != names_.class_members.end()) {
-      for (std::unordered_map<std::string, NameKind>::const_iterator member = members->second.begin();
+      for (std::unordered_map<NameId, NameKind>::const_iterator member = members->second.begin();
            member != members->second.end(); ++member)
         if (names_.scopes.back().find(member->first) == names_.scopes.back().end())
           names_.set_scope_name(names_.scopes.size() - 1, member->first, member->second);
@@ -465,7 +413,7 @@ private:
     if (members == names_.qualified_namespace_members.end()) return;
     for (std::unordered_map<std::string, NameKind>::const_iterator it = members->second.begin();
          it != members->second.end(); ++it)
-      names_.set_scope_name(names_.scopes.size() - 1, it->first, it->second);
+      names_.set_scope_name(names_.scopes.size() - 1, ast_.intern_name(it->first), it->second);
   }
   bool lexical_type_hint(const std::string& name) const
   {
@@ -477,7 +425,7 @@ private:
   {
     if (is("::")) return qualified_type_name_ahead();
     if (!is_identifier()) return false;
-    NameKind known = lookup_name(peek().text);
+    NameKind known = lookup_name(peek());
     if (known == ValueName) {
       return names_.namespace_aliases.find(peek().text) != names_.namespace_aliases.end() &&
           qualified_type_name_ahead();
@@ -494,16 +442,16 @@ private:
     std::size_t i = pos_ + offset;
     std::string name;
     bool global = false;
-    if (i < tokens_.size() && tokens_[i].text == "::") { global = true; name = "::"; ++i; }
-    if (i >= tokens_.size() || tokens_[i].category != IdentifierToken) return false;
+    if (has_token(i) && tokens_[i].text == "::") { global = true; name = "::"; ++i; }
+    if (!has_token(i) || tokens_[i].category != IdentifierToken) return false;
     const std::string first = tokens_[i].text;
     if (!global) {
-      const NameKind first_kind = lookup_name(first);
+      const NameKind first_kind = lookup_name(tokens_[i]);
       if ((first_kind == ValueName && names_.namespace_aliases.find(first) == names_.namespace_aliases.end()) ||
           first_kind == TemplateFunctionNameKind) return false;
     }
     name += tokens_[i++].text;
-    if (i < tokens_.size() && tokens_[i].text == "<") {
+    if (has_token(i) && tokens_[i].text == "<") {
       int angles = 0, parens = 0, brackets = 0, braces = 0;
       do {
         const std::string& text = tokens_[i].text;
@@ -518,20 +466,20 @@ private:
         else if (!parens && !brackets && !braces && text == ">>" && angles)
           angles = angles >= 2 ? angles - 2 : 0;
         name += text; ++i;
-      } while (i < tokens_.size() && angles > 0);
+      } while (has_token(i) && angles > 0);
     }
     bool qualified = false;
-    while (i + 1 < tokens_.size() && tokens_[i].text == "::" &&
+    while (has_token(i + 1) && tokens_[i].text == "::" &&
            tokens_[i + 1].category == IdentifierToken) {
       qualified = true; name += "::"; name += tokens_[i + 1].text; i += 2;
-      if (i < tokens_.size() && tokens_[i].text == "<") {
+      if (has_token(i) && tokens_[i].text == "<") {
         int angles = 0;
         do {
           if (tokens_[i].text == "<") ++angles;
           else if (tokens_[i].text == ">") --angles;
           else if (tokens_[i].text == ">>" && angles >= 2) angles -= 2;
           name += tokens_[i].text; ++i;
-        } while (i < tokens_.size() && angles > 0);
+        } while (has_token(i) && angles > 0);
       }
     }
     if (!qualified) return false;
@@ -550,10 +498,12 @@ private:
       std::unordered_map<std::string, std::string>::const_iterator alias = names_.type_alias_targets.find(prefix);
       if (alias != names_.type_alias_targets.end()) prefix = alias->second;
     }
-    std::unordered_map<std::string, std::unordered_map<std::string, NameKind> >::const_iterator members =
+    std::unordered_map<std::string, std::unordered_map<NameId, NameKind> >::const_iterator members =
         names_.class_members.find(class_lookup_key(prefix));
     if (members == names_.class_members.end()) return false;
-    std::unordered_map<std::string, NameKind>::const_iterator member = members->second.find(leaf);
+    const NameId leaf_id = ast_.find_name(leaf);
+    if (leaf_id == none) return false;
+    std::unordered_map<NameId, NameKind>::const_iterator member = members->second.find(leaf_id);
     return member != members->second.end() &&
         (member->second == TypeNameKind || member->second == TemplateNameKind);
   }
@@ -575,14 +525,14 @@ private:
       else if (!parens && !brackets && !braces && text == ">>" && angles)
         angles = angles >= 2 ? angles - 2 : 0;
       ++i;
-    } while (i < tokens_.size() && angles > 0);
-    return angles == 0 && i + 1 < tokens_.size() && tokens_[i].text == "::" &&
+    } while (has_token(i) && angles > 0);
+    return angles == 0 && has_token(i + 1) && tokens_[i].text == "::" &&
         tokens_[i + 1].category == IdentifierToken;
   }
   bool is_type_token(std::size_t offset) const
   {
     if (peek(offset).category != IdentifierToken) return false;
-    NameKind known = lookup_name(peek(offset).text);
+    NameKind known = lookup_name(peek(offset));
     return known == TypeNameKind || known == TemplateNameKind ||
         (known != ValueName && lexical_type_hint(peek(offset).text));
   }
@@ -599,7 +549,7 @@ private:
       if (first.text == type_words[i]) return true;
     if (!is_type_token(1) && !qualified_type_name_ahead(1)) return false;
     int parens = 0, brackets = 0, braces = 0, angles = 0;
-    for (std::size_t i = pos_ + 1; i < tokens_.size(); ++i) {
+    for (std::size_t i = pos_ + 1; has_token(i); ++i) {
       const std::string& text = tokens_[i].text;
       if (text == ")") { if (!parens && !brackets && !braces) return true; if (parens) --parens; }
       else if (text == "(") ++parens;
@@ -612,7 +562,7 @@ private:
       else if (!parens && !brackets && !braces && text == ">>" && angles >= 2) angles -= 2;
       else if (!parens && !brackets && !braces && !angles && text == ",") {
         const std::size_t next = i + 1;
-        if (next >= tokens_.size()) return false;
+        if (!has_token(next)) return false;
         const Token& token = tokens_[next];
         static const char* starters[] = {"bool", "char", "char16_t", "char32_t", "class",
           "const", "decltype", "double", "enum", "float", "int", "long", "short",
@@ -621,7 +571,7 @@ private:
         for (std::size_t j = 0; j < sizeof(starters) / sizeof(starters[0]); ++j)
           if (token.text == starters[j]) starts = true;
         if (token.category == IdentifierToken) {
-          const NameKind kind = lookup_name(token.text);
+          const NameKind kind = lookup_name(token);
           starts = starts || kind == TypeNameKind || kind == TemplateNameKind ||
               (kind != ValueName && lexical_type_hint(token.text)) ||
               qualified_type_name_ahead(next - pos_);
@@ -726,9 +676,11 @@ private:
       }
       if (!saw_type && is_type_name()) {
         std::size_t t = take();
-        std::string name = tokens_[t].text;
-        if (is("<") && template_id_candidate(name)) {
-          take(); name = read_template_suffix(name);
+        ParsedName name;
+        name.spelling = tokens_[t].text;
+        name.first_token = name.source_token = t;
+        if (is("<") && template_id_candidate(name.spelling)) {
+          take(); read_template_suffix(name);
           ast_.append(seq, composite_node(NDeclSpecifier, name));
         } else {
           ast_.append(seq, atom_node(NDeclSpecifier, t));
@@ -746,7 +698,9 @@ private:
     std::size_t keyword = take();
     expect("(");
     const std::size_t expression_begin = pos_;
+    ++template_expression_nesting_;
     std::size_t expression = parse_expression();
+    --template_expression_nesting_;
     const std::size_t expression_end = pos_;
     expect(")");
     std::string spelling = "decltype(";
@@ -756,50 +710,57 @@ private:
       spelling += tokens_[i].text;
     }
     spelling += ")";
-    (void)keyword;
-    std::size_t result = composite_node(kind, spelling);
+    std::size_t result = composite_node(kind, spelling, keyword);
     ast_.append(result, expression);
     return result;
   }
   bool is_word_token(const Token& token) const
   { return token.category == IdentifierToken || token.category == KeywordToken || token.category == LiteralToken; }
-  std::string read_decltype_qualified_name()
+  ParsedName read_decltype_qualified_name()
   {
-    expect("decltype");
-    std::string name = "decltype(";
-    expect("(");
-    int depth = 1;
-    while (depth && !at_end()) {
-      const std::string text = peek().text;
-      if (text == "(") ++depth;
-      else if (text == ")") --depth;
-      name += text;
-      take();
-    }
-    if (depth) fail("unterminated decltype expression");
+    const std::size_t keyword = pos_;
+    const std::size_t prefix = parse_decltype_specifier(NDecltypeSpecifier);
+    ParsedName name;
+    name.spelling = ast_.composite_atoms[ast_.nodes[prefix].composite];
+    name.source_token = keyword;
+    name.prefix_syntax = prefix;
     while (consume("::")) {
-      name += "::";
-      if (is_keyword("template")) { name += "template"; take(); }
+      name.spelling += "::";
+      if (is_keyword("template")) { name.spelling += "template"; take(); }
       if (!is_identifier() && peek().category != KeywordToken) fail("expected qualified name component");
-      name += peek().text;
-      take();
-      if (is("<")) { take(); name = read_template_suffix(name); }
+      const std::size_t component = take();
+      name.spelling += tokens_[component].text;
+      add_name_component(name, component);
+      if (is("<")) { take(); read_template_suffix(name); }
     }
     return name;
   }
-  std::string joined_name()
+  ParsedName joined_name()
   {
     if (is_keyword("decltype")) return read_decltype_qualified_name();
-    std::string name;
-    if (consume("::")) name = "::";
+    ParsedName name;
+    if (consume("::")) {
+      name.global_scope = true;
+      name.source_token = pos_ - 1;
+      name.spelling = "::";
+    }
     if (!is_identifier()) fail("expected identifier");
-    name += tokens_[take()].text;
-    if (is("<") && template_id_candidate(name)) { take(); name = read_template_suffix(name); }
+    const std::size_t first = take();
+    name.first_token = first;
+    if (name.source_token == none) name.source_token = first;
+    name.spelling += tokens_[first].text;
+    if (is("<") && template_id_candidate(name.spelling)) { take(); read_template_suffix(name); }
     while (consume("::")) {
-      name += "::";
+      name.spelling += "::";
+      const bool explicit_template = is_keyword("template");
+      if (explicit_template) { name.spelling += "template "; take(); }
       if (!is_identifier()) fail("expected qualified name component");
-      name += tokens_[take()].text;
-      if (is("<") && template_id_candidate(name)) { take(); name = read_template_suffix(name); }
+      const std::size_t component = take();
+      name.spelling += tokens_[component].text;
+      add_name_component(name, component);
+      if (is("<") && (explicit_template || template_id_candidate(name.spelling))) {
+        take(); read_template_suffix(name);
+      }
     }
     return name;
   }
@@ -815,10 +776,12 @@ private:
         kind == TemplateFunctionNameKind || lexical_type_hint(base)) return true;
     if (scope != std::string::npos) {
       const std::string owner = base.substr(0, scope);
-      std::unordered_map<std::string, std::unordered_map<std::string, NameKind> >::const_iterator members =
+      std::unordered_map<std::string, std::unordered_map<NameId, NameKind> >::const_iterator members =
           names_.class_members.find(class_lookup_key(owner));
       if (members != names_.class_members.end()) {
-        std::unordered_map<std::string, NameKind>::const_iterator member = members->second.find(leaf);
+        const NameId leaf_id = ast_.find_name(leaf);
+        if (leaf_id == none) return false;
+        std::unordered_map<NameId, NameKind>::const_iterator member = members->second.find(leaf_id);
         if (member != members->second.end() &&
             (member->second == TemplateNameKind || member->second == TemplateFunctionNameKind))
           return true;
@@ -826,20 +789,20 @@ private:
     }
     int depth = 0, parens = 0, brackets = 0;
     bool type_argument = false;
-    for (std::size_t i = pos_; i < tokens_.size(); ++i) {
+    for (std::size_t i = pos_; has_token(i); ++i) {
       const std::string& s = tokens_[i].text;
       if (s == "(") ++parens; else if (s == ")" && parens) --parens;
       else if (s == "[") ++brackets; else if (s == "]" && brackets) --brackets;
       if (!parens && !brackets) {
         if (s == "<") ++depth;
         else if (s == ">") { if (--depth == 0) {
-          const std::string& after = (i + 1 < tokens_.size()) ? tokens_[i + 1].text : std::string();
+          const std::string& after = has_token(i + 1) ? tokens_[i + 1].text.get() : std::string();
           return type_argument && (after == "(" || after == "::" || after == ")" ||
-              after == ";" || after == "," || (i + 1 < tokens_.size() && tokens_[i + 1].category == IdentifierToken));
+              after == ";" || after == "," || (has_token(i + 1) && tokens_[i + 1].category == IdentifierToken));
         }} else if (s == ">>" && depth >= 2) {
           depth -= 2;
           if (depth == 0) {
-            const std::string& after = (i + 1 < tokens_.size()) ? tokens_[i + 1].text : std::string();
+            const std::string& after = has_token(i + 1) ? tokens_[i + 1].text.get() : std::string();
             return type_argument && (after == "(" || after == "::" || after == ")" || after == ";" || after == ",");
           }
         }
@@ -895,8 +858,8 @@ private:
         !(is_keyword("class", 1) || is_keyword("struct", 1) || is_keyword("union", 1)))
       return false;
     std::size_t i = pos_ + 2;
-    if (i < tokens_.size() && tokens_[i].category == IdentifierToken) ++i;
-    return i < tokens_.size() && tokens_[i].text == ";";
+    if (has_token(i) && tokens_[i].category == IdentifierToken) ++i;
+    return has_token(i) && tokens_[i].text == ";";
   }
   std::size_t parse_friend_class_declaration()
   {
@@ -940,22 +903,22 @@ private:
     if (is_identifier() && is("=", 1)) {
       std::size_t n = take(); expect("=");
       std::size_t alias = node(NNamespaceAliasDefinition, n);
-      std::string target = joined_name();
+      ParsedName target = joined_name();
       ast_.append(alias, composite_node(NTarget, target));
-      bind_name(tokens_[n].text, NamespaceNameKind);
-      names_.set_namespace_alias(tokens_[n].text, target);
+      bind_name(tokens_[n], NamespaceNameKind);
+      names_.set_namespace_alias(tokens_[n].text, target.spelling);
       expect(";");
       return alias;
     }
     std::size_t name = none;
     if (is_identifier()) name = take();
-    if (name != none) bind_name(tokens_[name].text, NamespaceNameKind);
+    if (name != none) bind_name(tokens_[name], NamespaceNameKind);
     expect("{");
     if (name != none) {
       namespace_path_.push_back(tokens_[name].text);
       namespace_inline_.push_back(inline_namespace);
     }
-    names_.scopes.push_back(std::unordered_map<std::string, NameKind>());
+    names_.scopes.push_back(std::unordered_map<NameId, NameKind>());
     if (!namespace_path_.empty()) {
       std::string current_namespace;
       for (std::size_t i = 0; i < namespace_path_.size(); ++i) {
@@ -984,24 +947,24 @@ private:
       std::size_t alias = node(NAliasDeclaration, name);
       std::size_t target = parse_type_id();
       ast_.append(alias, target);
-      bind_name(tokens_[name].text, TypeNameKind);
+      bind_name(tokens_[name], TypeNameKind);
       const std::string target_name = type_id_display(target);
       if (!target_name.empty()) names_.set_type_alias(tokens_[name].text, target_name);
       expect(";");
       return alias;
     }
-    std::string target = joined_name();
+    ParsedName target = joined_name();
     expect(";");
     if (directive) {
-      import_namespace(target);
+      import_namespace(target.spelling);
       std::size_t n = node(NUsingDirective);
       ast_.append(n, composite_node(NTarget, target));
       return n;
     }
-    NameKind imported = lookup_name(target);
-    const std::size_t separator = target.rfind("::");
+    NameKind imported = lookup_name(target.spelling);
+    const std::size_t separator = target.spelling.rfind("::");
     if (imported != UnknownName)
-      bind_name(separator == std::string::npos ? target : target.substr(separator + 2), imported);
+      bind_name(separator == std::string::npos ? target.spelling : target.spelling.substr(separator + 2), imported);
     std::size_t n = node(NUsingDeclaration);
     ast_.append(n, composite_node(NTarget, target));
     return n;
@@ -1042,8 +1005,8 @@ private:
       while (is_builtin_type());
       any = true;
     } else if (is_identifier() || is("::")) {
-      std::string name = joined_name();
-      if (is("<")) { take(); name = read_template_suffix(name); }
+      ParsedName name = joined_name();
+      if (is("<")) { take(); read_template_suffix(name); }
       ast_.append(seq, composite_node(NTypeName, name)); any = true;
     }
     if (!any) fail("expected type-id");
@@ -1071,7 +1034,11 @@ private:
           ast_.append(abstract, parse_parameter_clause());
         } else if (consume("[")) {
           std::size_t array = node(NArraySuffix);
-          if (!is("]")) ast_.append(array, parse_expression());
+          if (!is("]")) {
+            ++template_expression_nesting_;
+            ast_.append(array, parse_expression());
+            --template_expression_nesting_;
+          }
           expect("]"); ast_.append(abstract, array);
         } else break;
       }
@@ -1090,55 +1057,92 @@ private:
         peek(offset).text == "typename" || peek(offset).text == "decltype") return true;
     return is_type_token(offset);
   }
-  std::string read_template_suffix(std::string name)
+  bool is_template_close() const
   {
-    int depth = 1, parens = 0, brackets = 0, braces = 0;
-    bool have_previous = false, previous_word = false;
-    name += '<';
-    while (!at_end() && depth > 0) {
-      const Token current = peek();
-      const std::string text = peek().text;
-      if (text == "(") ++parens;
-      else if (text == ")" && parens) --parens;
-      else if (text == "[") ++brackets;
-      else if (text == "]" && brackets) --brackets;
-      else if (text == "{") ++braces;
-      else if (text == "}" && braces) --braces;
-      else if (!parens && !brackets && !braces && text == "<" &&
-               !template_argument_less_than()) ++depth;
-      else if (!parens && !brackets && !braces && text == ">") --depth;
-      else if (!parens && !brackets && !braces && text == ">>") {
-        if (depth >= 2) depth -= 2;
-        else { depth = 0; ++pending_gt_; }
-      }
-      const bool current_word = is_word_token(current);
-      if (have_previous && previous_word && current_word) name += ' ';
-      name += text;
-      have_previous = true;
-      previous_word = current_word;
-      take();
-    }
-    if (depth != 0) fail("unterminated template-id");
-    return name;
+    return pending_gt_ != 0 || is(">") || is(">>");
   }
-  bool template_argument_less_than() const
+  bool consume_template_close()
   {
-    if (pos_ == 0) return false;
-    const Token& previous = tokens_[pos_ - 1];
-    if (previous.category == LiteralToken || previous.text == ")" || previous.text == "]") return true;
-    if (previous.category != IdentifierToken) return false;
-    if (lookup_name(previous.text) == ValueName) return true;
-    if (pos_ >= 3 && tokens_[pos_ - 2].text == "::") {
-      const std::string qualified = tokens_[pos_ - 3].text + "::" + previous.text;
-      const NameKind kind = lookup_name(qualified);
-      if (kind != TypeNameKind && kind != TemplateNameKind) return true;
+    if (pending_gt_) {
+      --pending_gt_;
+      return true;
     }
+    if (is(">")) { ++pos_; return true; }
+    if (is(">>")) { ++pos_; ++pending_gt_; return true; }
     return false;
+  }
+  bool template_argument_terminator() const
+  {
+    if (template_argument_nesting_.empty() ||
+        template_expression_nesting_ != template_argument_nesting_.back()) return false;
+    if (is(">")) return true;
+    return is(">>");
+  }
+  bool template_argument_starts_type() const
+  {
+    if (is("::")) return qualified_type_name_ahead();
+    if (!type_starts_at(0)) return false;
+    if (is_identifier() && is("::", 1) && !qualified_type_name_ahead()) return false;
+    if (is_identifier() && template_id_followed_by_scope() &&
+        !qualified_type_name_ahead()) return false;
+    return true;
+  }
+  void read_template_suffix(ParsedName& name)
+  {
+    const std::size_t open = pos_ - 1;
+    ensure_name_syntax(name);
+    const std::size_t template_id = node(NTemplateIdSyntax);
+    set_node_location_from_token(template_id, open);
+    ast_.append(name.last_component, template_id);
+    const std::size_t arguments = node(NTemplateArgumentList);
+    ast_.append(template_id, arguments);
+
+    if (!is_template_close()) {
+      for (;;) {
+        const bool type_argument = template_argument_starts_type();
+        const std::size_t argument = node(type_argument ?
+            NTypeTemplateArgument : NExpressionTemplateArgument);
+        template_argument_nesting_.push_back(template_expression_nesting_);
+        std::size_t value = type_argument ? parse_type_id() : parse_assignment();
+        if (consume("...")) {
+          const std::size_t expansion = node(type_argument ? NPackExpansion : NPackExpansionExpression);
+          ast_.append(expansion, value);
+          value = expansion;
+        }
+        template_argument_nesting_.pop_back();
+        ast_.append(argument, value);
+        ast_.append(arguments, argument);
+        if (!consume(",")) break;
+      }
+    }
+    if (!consume_template_close()) fail("unterminated template-id");
+
+    std::string suffix;
+    bool have_previous = false;
+    bool previous_word = false;
+    for (std::size_t i = open; i < pos_; ++i) {
+      std::string text = tokens_[i].text;
+      if (i + 1 == pos_ && pending_gt_) {
+        std::size_t trim = pending_gt_;
+        while (trim && !text.empty() && text[text.size() - 1] == '>') {
+          text.erase(text.size() - 1);
+          --trim;
+        }
+      }
+      const bool current_word = is_word_token(tokens_[i]);
+      if (!text.empty()) {
+        if (have_previous && previous_word && current_word) suffix += ' ';
+        suffix += text;
+      }
+      have_previous = have_previous || !text.empty();
+      previous_word = current_word;
+    }
+    name.spelling += suffix;
   }
   std::size_t parse_template_declaration(bool in_class = false)
   {
     take(); expect("<");
-    names_.scopes.push_back(std::unordered_map<std::string, NameKind>());
+    names_.scopes.push_back(std::unordered_map<NameId, NameKind>());
     std::size_t clause = node(NTemplateParameterClause);
     if (!consume(">")) {
       std::size_t list = node(NTemplateParameterList);
@@ -1198,7 +1202,7 @@ private:
       ast_.append(p, atom_node(NParameterKey, key));
       if (is_identifier()) {
         std::size_t id = take(); ast_.append(p, atom_node(NIdentifier, id));
-        bind_name(tokens_[id].text, TemplateNameKind);
+        bind_name(tokens_[id], TemplateNameKind);
       }
       if (consume("=")) {
         std::size_t d = node(NDefaultTemplateArgument);
@@ -1230,7 +1234,7 @@ private:
     if (!is("=") && !is(",") && !is(">")) {
       std::size_t d = parse_declarator(false); ast_.append(p, d);
       std::size_t id = find_identifier_node(d);
-      if (id != none) { bind_name(tokens_[id].text, ValueName); has_parameter_name = true; }
+      if (id != none) { bind_name(tokens_[id], ValueName); has_parameter_name = true; }
     }
     if (consume("=")) {
       std::size_t d = node(NDefaultTemplateArgument);
@@ -1249,11 +1253,13 @@ private:
     }
     return p;
   }
-  std::string read_class_name()
+  ParsedName read_class_name()
   {
     if (!is_identifier()) fail("expected class name");
-    std::string name = tokens_[take()].text;
-    if (is("<")) { take(); name = read_template_suffix(name); }
+    ParsedName name;
+    name.first_token = name.source_token = take();
+    name.spelling = tokens_[name.first_token].text;
+    if (is("<")) { take(); read_template_suffix(name); }
     return name;
   }
   std::size_t parse_class()
@@ -1267,27 +1273,21 @@ private:
     std::size_t key = take();
     skip_alignas_specifier();
     skip_attribute_specifier();
-    std::string name;
+    ParsedName name;
     if (is_identifier()) name = read_class_name();
-    const std::string registry_name = name.empty() ? std::string() : qualified_class_name(name);
+    const std::string registry_name = name.spelling.empty() ? std::string() : qualified_class_name(name.spelling);
     if (!embedded && is(";")) {
       take();
-      if (!name.empty()) bind_name(name, TypeNameKind);
+      if (!name.spelling.empty()) bind_name(name.spelling, TypeNameKind);
       std::size_t n = node(NClassForwardDeclaration, key);
-      if (!name.empty()) {
-        ast_.composite_atoms.push_back(name);
-        ast_.nodes[n].composite = ast_.composite_atoms.size() - 1;
-      }
+      if (!name.spelling.empty()) set_composite_name(n, name);
       std::size_t keynode = atom_node(NClassKey, key); ast_.append(n, keynode);
       return n;
     }
     std::size_t n = node(NClassSpecifier, key);
-    if (!name.empty()) {
-      ast_.composite_atoms.push_back(name);
-      ast_.nodes[n].composite = ast_.composite_atoms.size() - 1;
-    }
+    if (!name.spelling.empty()) set_composite_name(n, name);
     ast_.append(n, atom_node(NClassKey, key));
-    if (!name.empty()) bind_name(name, TypeNameKind);
+    if (!name.spelling.empty()) bind_name(name.spelling, TypeNameKind);
     if (consume(":")) {
       const std::size_t bases = parse_base_clause();
       ast_.append(n, bases);
@@ -1298,7 +1298,7 @@ private:
       fail("expected class body");
     }
     expect("{");
-    names_.scopes.push_back(std::unordered_map<std::string, NameKind>());
+    names_.scopes.push_back(std::unordered_map<NameId, NameKind>());
     class_context_names_.push_back(registry_name);
     class_scope_indices_.push_back(names_.scopes.size() - 1);
     std::unordered_map<std::string, std::vector<std::string> >::const_iterator inherited =
@@ -1316,17 +1316,17 @@ private:
       if ((is_keyword("public") || is_keyword("protected") || is_keyword("private")) && is(":", 1)) {
         ast_.append(n, atom_node(NAccessSpecifier, take())); expect(":"); continue;
       }
-      if (is_identifier() && peek().text == class_name_leaf(name) && is("(", 1)) {
-        ast_.append(n, parse_special_member(name)); continue;
+      if (is_identifier() && peek().text == class_name_leaf(name.spelling) && is("(", 1)) {
+        ast_.append(n, parse_special_member(name.spelling)); continue;
       }
       if (is_keyword("virtual") && (is("~", 1) || is_keyword("operator", 1) ||
-          (is_identifier(1) && peek(1).text == class_name_leaf(name)))) {
+          (is_identifier(1) && peek(1).text == class_name_leaf(name.spelling)))) {
         std::size_t specifier = take();
         skip_attribute_specifier();
-        ast_.append(n, parse_special_member(name, specifier)); continue;
+        ast_.append(n, parse_special_member(name.spelling, specifier)); continue;
       }
       if (is("~") || is_keyword("operator")) {
-        ast_.append(n, parse_special_member(name)); continue;
+        ast_.append(n, parse_special_member(name.spelling)); continue;
       }
       if (is_keyword("template")) {
         ast_.append(n, parse_template_declaration(true)); continue;
@@ -1371,13 +1371,13 @@ private:
   void predeclare_class_types()
   {
     int braces = 0;
-    for (std::size_t i = pos_; i < tokens_.size();) {
+    for (std::size_t i = pos_; has_token(i);) {
       const std::string& text = tokens_[i].text;
       if (braces == 0 && text == "}") break;
-      if (braces == 0 && text == "template" && i + 1 < tokens_.size() && tokens_[i + 1].text == "<") {
+      if (braces == 0 && text == "template" && has_token(i + 1) && tokens_[i + 1].text == "<") {
         i += 2;
         int angles = 1;
-        while (i < tokens_.size() && angles) {
+        while (has_token(i) && angles) {
           if (tokens_[i].text == "<") ++angles;
           else if (tokens_[i].text == ">") --angles;
           else if (tokens_[i].text == ">>" && angles >= 2) angles -= 2;
@@ -1387,25 +1387,25 @@ private:
       }
       if (braces == 0 && (text == "class" || text == "struct" || text == "union" || text == "enum")) {
         std::size_t name = i + 1;
-        if (text == "enum" && name < tokens_.size() &&
+        if (text == "enum" && has_token(name) &&
             (tokens_[name].text == "class" || tokens_[name].text == "struct")) ++name;
-        if (text != "enum" && name < tokens_.size() && tokens_[name].text == "alignas") {
+        if (text != "enum" && has_token(name) && tokens_[name].text == "alignas") {
           ++name;
-          if (name < tokens_.size() && tokens_[name].text == "(") {
+          if (has_token(name) && tokens_[name].text == "(") {
             int parens = 0;
             do {
               if (tokens_[name].text == "(") ++parens;
               else if (tokens_[name].text == ")") --parens;
               ++name;
-            } while (name < tokens_.size() && parens);
+            } while (has_token(name) && parens);
           }
         }
-        if (name < tokens_.size() && tokens_[name].category == IdentifierToken)
-          bind_name(tokens_[name].text, TypeNameKind);
+        if (has_token(name) && tokens_[name].category == IdentifierToken)
+          bind_name(tokens_[name], TypeNameKind);
       }
-      if (braces == 0 && text == "using" && i + 2 < tokens_.size() &&
+      if (braces == 0 && text == "using" && has_token(i + 2) &&
           tokens_[i + 1].category == IdentifierToken && tokens_[i + 2].text == "=")
-        bind_name(tokens_[i + 1].text, TypeNameKind);
+        bind_name(tokens_[i + 1], TypeNameKind);
       if (text == "{") ++braces;
       else if (text == "}" && braces) --braces;
       ++i;
@@ -1414,26 +1414,26 @@ private:
   bool class_definition_or_forward_ahead() const
   {
     std::size_t i = pos_ + 1;
-    if (i < tokens_.size() && (tokens_[i].text == "alignas")) {
+    if (has_token(i) && (tokens_[i].text == "alignas")) {
       ++i;
-      if (i >= tokens_.size() || tokens_[i].text != "(") return false;
+      if (!has_token(i) || tokens_[i].text != "(") return false;
       int parens = 0;
       do {
         if (tokens_[i].text == "(") ++parens;
         else if (tokens_[i].text == ")") --parens;
         ++i;
-      } while (i < tokens_.size() && parens);
+      } while (has_token(i) && parens);
     }
-    if (i + 1 < tokens_.size() && tokens_[i].text == "[" && tokens_[i + 1].text == "[") {
+    if (has_token(i + 1) && tokens_[i].text == "[" && tokens_[i + 1].text == "[") {
       i += 2; int brackets = 2;
-      while (i < tokens_.size() && brackets) {
+      while (has_token(i) && brackets) {
         if (tokens_[i].text == "[") ++brackets;
         else if (tokens_[i].text == "]") --brackets;
         ++i;
       }
     }
-    if (i < tokens_.size() && tokens_[i].category == IdentifierToken) ++i;
-    if (i < tokens_.size() && tokens_[i].text == "<") {
+    if (has_token(i) && tokens_[i].category == IdentifierToken) ++i;
+    if (has_token(i) && tokens_[i].text == "<") {
       int angles = 0, parens = 0, brackets = 0, braces = 0;
       do {
         const std::string& text = tokens_[i].text;
@@ -1448,45 +1448,45 @@ private:
         else if (!parens && !brackets && !braces && text == ">>" && angles)
           angles = angles >= 2 ? angles - 2 : 0;
         ++i;
-      } while (i < tokens_.size() && angles > 0);
+      } while (has_token(i) && angles > 0);
     }
-    if (i < tokens_.size() && tokens_[i].text == ":") {
-      while (i < tokens_.size() && tokens_[i].text != "{" && tokens_[i].text != ";") ++i;
+    if (has_token(i) && tokens_[i].text == ":") {
+      while (has_token(i) && tokens_[i].text != "{" && tokens_[i].text != ";") ++i;
     }
-    if (i >= tokens_.size()) return false;
+    if (!has_token(i)) return false;
     if (tokens_[i].text == ";") return true;
     if (tokens_[i].text != "{") return false;
     int braces = 1; ++i;
-    while (i < tokens_.size() && braces) {
+    while (has_token(i) && braces) {
       if (tokens_[i].text == "{") ++braces;
       else if (tokens_[i].text == "}") --braces;
       ++i;
     }
-    return braces == 0 && i < tokens_.size() && tokens_[i].text == ";";
+    return braces == 0 && has_token(i) && tokens_[i].text == ";";
   }
   bool enum_declaration_ahead() const
   {
     std::size_t i = pos_ + 1;
-    if (i < tokens_.size() && (tokens_[i].text == "class" || tokens_[i].text == "struct")) ++i;
-    if (i < tokens_.size() && tokens_[i].category == IdentifierToken) ++i;
-    if (i < tokens_.size() && tokens_[i].text == ":") {
-      while (i < tokens_.size() && tokens_[i].text != "{" && tokens_[i].text != ";") ++i;
+    if (has_token(i) && (tokens_[i].text == "class" || tokens_[i].text == "struct")) ++i;
+    if (has_token(i) && tokens_[i].category == IdentifierToken) ++i;
+    if (has_token(i) && tokens_[i].text == ":") {
+      while (has_token(i) && tokens_[i].text != "{" && tokens_[i].text != ";") ++i;
     }
-    if (i >= tokens_.size()) return false;
+    if (!has_token(i)) return false;
     if (tokens_[i].text == ";") return true;
     if (tokens_[i].text != "{") return false;
     int braces = 1; ++i;
-    while (i < tokens_.size() && braces) {
+    while (has_token(i) && braces) {
       if (tokens_[i].text == "{") ++braces;
       else if (tokens_[i].text == "}") --braces;
       ++i;
     }
-    return braces == 0 && i < tokens_.size() && tokens_[i].text == ";";
+    return braces == 0 && has_token(i) && tokens_[i].text == ";";
   }
   bool has_colon_before_comma_or_semicolon() const
   {
     int parens = 0, brackets = 0, braces = 0, conditionals = 0;
-    for (std::size_t i = pos_; i < tokens_.size(); ++i) {
+    for (std::size_t i = pos_; has_token(i); ++i) {
       const std::string& s = tokens_[i].text;
       if (parens == 0 && brackets == 0 && braces == 0 && (s == "{" || s == "}")) return false;
       if (s == "(" ) ++parens; else if (s == ")") { if (parens) --parens; }
@@ -1528,26 +1528,38 @@ private:
   }
   std::size_t parse_special_member(const std::string& class_name, std::size_t leading_specifier = none)
   {
+    const std::size_t member_source = pos_;
     std::string name;
+    ParsedName operator_name;
+    bool has_operator_name = false;
     if (consume("~")) {
       name = "~";
       if (!is_identifier()) fail("expected destructor name");
       name += tokens_[take()].text;
     } else if (is_keyword("operator")) {
-      name = parse_operator_name();
-      if (name.compare(0, 9, "operator ") == 0) name.erase(8, 1);
+      operator_name.operator_tokens_begin = pos_;
+      operator_name.spelling = parse_operator_name();
+      operator_name.operator_tokens_end = pos_;
+      operator_name.first_token = operator_name.source_token =
+          operator_name.operator_tokens_begin;
+      if (operator_name.spelling.compare(0, 9, "operator ") == 0)
+        operator_name.spelling.erase(8, 1);
+      name = operator_name.spelling;
+      has_operator_name = true;
     } else {
       if (!is_identifier()) fail("expected special member name");
       name = tokens_[take()].text;
     }
-    std::size_t member = composite_node(NSpecialMemberDefinition, name);
+    std::size_t member = composite_node(NSpecialMemberDefinition, name, member_source);
     if (leading_specifier != none) {
       std::size_t specs = node(NMemberSpecifiers);
       ast_.append(specs, atom_node(NSpecifier, leading_specifier));
       ast_.append(member, specs);
     }
     std::size_t decl = node(NDeclarator);
-    ast_.append(decl, composite_node(NIdentifier, name));
+    ast_.append(decl, has_operator_name ?
+        composite_node(NIdentifier, operator_name) :
+        composite_node(NIdentifier, name, member_source));
     ast_.append(decl, parse_parameter_clause());
     ast_.append(member, decl);
     while (is_cv() || is("&") || is("&&") || is_keyword("noexcept") || is_keyword("throw") ||
@@ -1575,40 +1587,40 @@ private:
     if (peek(offset).category != IdentifierToken) return false;
     std::string first = peek(offset).text;
     std::size_t i = pos_ + offset + 1;
-    if (i < tokens_.size() && tokens_[i].text == "<") {
+    if (has_token(i) && tokens_[i].text == "<") {
       int angles = 0;
       do {
         if (tokens_[i].text == "<") ++angles;
         else if (tokens_[i].text == ">") --angles;
         else if (tokens_[i].text == ">>" && angles >= 2) angles -= 2;
         ++i;
-      } while (i < tokens_.size() && angles > 0);
+      } while (has_token(i) && angles > 0);
     }
     std::size_t angle = first.find('<');
     if (angle != std::string::npos) first.erase(angle);
-    while (i + 1 < tokens_.size() && tokens_[i].text == "::") {
+    while (has_token(i + 1) && tokens_[i].text == "::") {
       ++i;
       if (tokens_[i].text == "~") return true;
       if (tokens_[i].text == "operator") return conversion_type_starts_at(i + 1);
       if (tokens_[i].category == IdentifierToken && tokens_[i].text == first &&
-          i + 1 < tokens_.size() && tokens_[i + 1].text == "(") return true;
+          has_token(i + 1) && tokens_[i + 1].text == "(") return true;
       if (tokens_[i].category != IdentifierToken) return false;
       ++i;
-      if (i < tokens_.size() && tokens_[i].text == "<") {
+      if (has_token(i) && tokens_[i].text == "<") {
         int angles = 0;
         do {
           if (tokens_[i].text == "<") ++angles;
           else if (tokens_[i].text == ">") --angles;
           else if (tokens_[i].text == ">>" && angles >= 2) angles -= 2;
           ++i;
-        } while (i < tokens_.size() && angles > 0);
+        } while (has_token(i) && angles > 0);
       }
     }
     return false;
   }
   bool conversion_type_starts_at(std::size_t i) const
   {
-    if (i >= tokens_.size()) return false;
+    if (!has_token(i)) return false;
     const std::string& text = tokens_[i].text;
     if (text == "new" || text == "delete" || text == "[" || text == "(") return false;
     if (tokens_[i].category == IdentifierToken || text == "::") return true;
@@ -1655,7 +1667,7 @@ private:
     std::size_t init = node(NCtorInitializer);
     do {
       std::size_t item = node(NMemInitializer);
-      std::string name = joined_name();
+      ParsedName name = joined_name();
       ast_.append(item, composite_node(NMemInitializerId, name));
       if (consume("(")) {
         std::size_t args = node(NParenArgumentList);
@@ -1762,7 +1774,7 @@ private:
     while (!consume("}")) {
       if (!is_identifier()) fail("expected enumerator");
       std::size_t id = take(), e = node(NEnumerator, id);
-      if (key == none) bind_name(tokens_[id].text, ValueName);
+      if (key == none) bind_name(tokens_[id], ValueName);
       if (consume("=")) ast_.append(e, parse_assignment());
       ast_.append(n, e);
       if (!consume(",")) { expect("}"); break; }
@@ -1789,7 +1801,7 @@ private:
   }
   std::size_t parse_simple_after_spec(std::size_t spec)
   {
-    names_.scopes.push_back(std::unordered_map<std::string, NameKind>());
+    names_.scopes.push_back(std::unordered_map<NameId, NameKind>());
     bool is_typedef = contains_decl_specifier(spec, "typedef");
     const std::string typedef_target = is_typedef ? declared_type_name(spec) : std::string();
     std::vector<std::size_t> init_nodes;
@@ -1801,7 +1813,7 @@ private:
         ast_.append(f, spec); ast_.append(f, decl);
         import_class_members_for_declarator(decl);
         std::size_t function_name = find_identifier_node(decl);
-        if (function_name != none) bind_name(tokens_[function_name].text, ValueName);
+        if (function_name != none) bind_name(tokens_[function_name], ValueName);
         if (is_keyword("try")) ast_.append(f, parse_function_try_block(false));
         else ast_.append(f, parse_compound_statement());
         names_.scopes.pop_back();
@@ -1815,7 +1827,7 @@ private:
       std::size_t declarator = ast_.nodes[init_nodes[i]].first_child;
       std::size_t identifier = find_identifier_node(declarator);
       if (identifier != none)
-        bind_name_in_scope(names_.scopes.size() - 2, tokens_[identifier].text,
+        bind_name_in_scope(names_.scopes.size() - 2, tokens_[identifier],
                            is_typedef ? TypeNameKind : ValueName);
       if (is_typedef && identifier != none && !typedef_target.empty())
         names_.set_type_alias(tokens_[identifier].text, typedef_target);
@@ -1888,41 +1900,51 @@ private:
   bool member_pointer_operator_ahead() const
   {
     std::size_t i = pos_;
-    if (i < tokens_.size() && tokens_[i].text == "::") ++i;
-    if (i >= tokens_.size() || tokens_[i].category != IdentifierToken) return false;
+    if (has_token(i) && tokens_[i].text == "::") ++i;
+    if (!has_token(i) || tokens_[i].category != IdentifierToken) return false;
     ++i;
     for (;;) {
-      if (i < tokens_.size() && tokens_[i].text == "<") {
+      if (has_token(i) && tokens_[i].text == "<") {
         int depth = 0;
         do {
           if (tokens_[i].text == "<") ++depth;
           else if (tokens_[i].text == ">") --depth;
           else if (tokens_[i].text == ">>" && depth >= 2) depth -= 2;
           ++i;
-        } while (i < tokens_.size() && depth > 0);
+        } while (has_token(i) && depth > 0);
       }
-      if (i >= tokens_.size() || tokens_[i].text != "::") return false;
-      if (i + 1 < tokens_.size() && tokens_[i + 1].text == "*") return true;
-      if (i + 1 >= tokens_.size() || tokens_[i + 1].category != IdentifierToken) return false;
+      if (!has_token(i) || tokens_[i].text != "::") return false;
+      if (has_token(i + 1) && tokens_[i + 1].text == "*") return true;
+      if (!has_token(i + 1) || tokens_[i + 1].category != IdentifierToken) return false;
       i += 2;
     }
   }
-  std::string parse_member_pointer_operator()
+  ParsedName parse_member_pointer_operator()
   {
-    std::string name;
-    if (consume("::")) name = "::";
+    ParsedName name;
+    if (consume("::")) {
+      name.global_scope = true;
+      name.source_token = pos_ - 1;
+      name.spelling = "::";
+    }
     if (!is_identifier()) fail("expected member pointer class name");
-    name += tokens_[take()].text;
-    if (is("<") && template_id_candidate(name)) { take(); name = read_template_suffix(name); }
+    const std::size_t first = take();
+    name.first_token = first;
+    if (name.source_token == none) name.source_token = first;
+    name.spelling += tokens_[first].text;
+    if (is("<") && template_id_candidate(name.spelling)) { take(); read_template_suffix(name); }
     while (consume("::")) {
-      name += "::";
+      name.spelling += "::";
       if (is("*")) break;
       if (!is_identifier()) fail("expected member pointer qualifier");
-      name += tokens_[take()].text;
-      if (is("<") && template_id_candidate(name)) { take(); name = read_template_suffix(name); }
+      const std::size_t component = take();
+      name.spelling += tokens_[component].text;
+      add_name_component(name, component);
+      if (is("<") && template_id_candidate(name.spelling)) { take(); read_template_suffix(name); }
     }
     expect("*");
-    return name + "*";
+    name.spelling += "*";
+    return name;
   }
   std::size_t parse_declarator(bool abstract_ok)
   {
@@ -1945,7 +1967,12 @@ private:
       if (is_identifier()) ast_.append(d, atom_node(NIdentifier, take()));
       else if (!abstract_ok) fail("expected declarator name after pack");
     } else if (is_keyword("operator")) {
-      ast_.append(d, composite_node(NIdentifier, parse_operator_name()));
+      ParsedName name;
+      name.operator_tokens_begin = pos_;
+      name.spelling = parse_operator_name();
+      name.operator_tokens_end = pos_;
+      name.first_token = name.source_token = name.operator_tokens_begin;
+      ast_.append(d, composite_node(NIdentifier, name));
     } else if (is_identifier() || is("::")) {
       ast_.append(d, parse_declarator_id());
     } else if (!abstract_ok) {
@@ -1958,7 +1985,11 @@ private:
         ast_.append(d, parse_parameter_clause());
       } else if (consume("[")) {
         std::size_t array = node(NArraySuffix);
-        if (!is("]")) ast_.append(array, parse_expression());
+        if (!is("]")) {
+          ++template_expression_nesting_;
+          ast_.append(array, parse_expression());
+          --template_expression_nesting_;
+        }
         expect("]");
         ast_.append(d, array);
       } else if (is_cv()) {
@@ -1990,30 +2021,45 @@ private:
   }
   std::size_t parse_declarator_id()
   {
-    std::string name;
+    ParsedName name;
     bool qualified = consume("::");
-    if (qualified) name = "::";
+    if (qualified) {
+      name.global_scope = true;
+      name.source_token = pos_ - 1;
+      name.spelling = "::";
+    }
     if (!is_identifier()) fail("expected declarator identifier");
     std::size_t first = take();
-    name += tokens_[first].text;
-    if (is("<") && template_id_candidate(name)) { take(); name = read_template_suffix(name); qualified = true; }
+    name.first_token = first;
+    if (name.source_token == none) name.source_token = first;
+    name.spelling += tokens_[first].text;
+    if (is("<") && template_id_candidate(name.spelling)) { take(); read_template_suffix(name); qualified = true; }
     while (consume("::")) {
-      qualified = true; name += "::";
-      if (is_keyword("template")) { name += "template "; take(); }
+      qualified = true; name.spelling += "::";
+      if (is_keyword("template")) { name.spelling += "template "; take(); }
       if (is_keyword("operator")) {
-        name += parse_operator_name();
+        const std::size_t operator_token = pos_;
+        const std::string operator_name = parse_operator_name();
+        name.spelling += operator_name;
+        name.operator_tokens_begin = operator_token;
+        name.operator_tokens_end = pos_;
+        add_name_component(name, operator_token);
       } else if (consume("~")) {
-        name += "~";
+        name.spelling += "~";
         if (!is_identifier()) fail("expected destructor identifier");
-        name += tokens_[take()].text;
+        const std::size_t component = take();
+        name.spelling += tokens_[component].text;
+        add_name_component(name, component);
       } else {
         if (!is_identifier()) fail("expected qualified declarator identifier");
-        name += tokens_[take()].text;
-        if (is("<") && template_id_candidate(name)) { take(); name = read_template_suffix(name); }
+        const std::size_t component = take();
+        name.spelling += tokens_[component].text;
+        add_name_component(name, component);
+        if (is("<") && template_id_candidate(name.spelling)) { take(); read_template_suffix(name); }
       }
     }
     if (qualified) return composite_node(NIdentifier, name);
-    if (ast_.composite_atoms.size() && name != tokens_[first].text)
+    if (name.spelling != tokens_[first].text)
       return composite_node(NIdentifier, name);
     return atom_node(NIdentifier, first);
   }
@@ -2133,7 +2179,7 @@ private:
       ast_.append(clause, p);
       // Parameter names take effect only after their own declarator is parsed.
       const std::size_t id = find_declared_identifier(p);
-      if (id != none) bind_name(tokens_[id].text, ValueName);
+      if (id != none) bind_name(tokens_[id], ValueName);
       if (consume(")")) break;
       expect(",");
       if (consume("...")) { ast_.append(clause, node(NParameterPack, pos_ - 1)); expect(")"); break; }
@@ -2172,8 +2218,10 @@ private:
     expect("{");
     std::size_t n = node(NBracedInitList);
     if (!consume("}")) {
+      ++template_expression_nesting_;
       do { ast_.append(n, parse_initializer_clause()); } while (consume(",") && !is("}"));
       expect("}");
+      --template_expression_nesting_;
     }
     return n;
   }
@@ -2182,8 +2230,10 @@ private:
     expect("(");
     std::size_t n = node(NParenInitializer);
     if (!consume(")")) {
+      ++template_expression_nesting_;
       do { ast_.append(n, parse_initializer_clause()); } while (consume(","));
       expect(")");
+      --template_expression_nesting_;
     }
     return n;
   }
@@ -2192,7 +2242,7 @@ private:
   {
     expect("{");
     std::size_t block = node(NCompoundStatement);
-    names_.scopes.push_back(std::unordered_map<std::string, NameKind>());
+    names_.scopes.push_back(std::unordered_map<NameId, NameKind>());
     while (!consume("}")) {
       if (at_end()) fail("unterminated compound statement");
       std::size_t before = pos_;
@@ -2280,7 +2330,7 @@ private:
   {
     take(); expect("(");
     std::size_t n = node(NIfStatement), condition = node(NCondition);
-    names_.scopes.push_back(std::unordered_map<std::string, NameKind>());
+    names_.scopes.push_back(std::unordered_map<NameId, NameKind>());
     if (starts_decl_specifier() && condition_declaration_ahead())
       ast_.append(condition, parse_condition_declaration());
     else
@@ -2310,7 +2360,7 @@ private:
     std::size_t declarator = parse_declarator(false);
     ast_.append(condition, declarator);
     std::size_t identifier = find_identifier_node(declarator);
-    if (identifier != none) bind_name(tokens_[identifier].text, ValueName);
+    if (identifier != none) bind_name(tokens_[identifier], ValueName);
     if (consume("=")) {
       std::size_t initializer = node(NInitializer);
       ast_.append(initializer, parse_initializer_clause());
@@ -2339,7 +2389,7 @@ private:
   bool range_for_ahead() const
   {
     int parens = 0, brackets = 0, braces = 0, questions = 0;
-    for (std::size_t i = pos_; i < tokens_.size(); ++i) {
+    for (std::size_t i = pos_; has_token(i); ++i) {
       const std::string& s = tokens_[i].text;
       if (s == "(" ) ++parens; else if (s == ")") { if (parens) --parens; else return false; }
       else if (s == "[") ++brackets; else if (s == "]") { if (brackets) --brackets; }
@@ -2355,12 +2405,12 @@ private:
   {
     take(); expect("(");
     if (range_for_ahead()) {
-      names_.scopes.push_back(std::unordered_map<std::string, NameKind>());
+      names_.scopes.push_back(std::unordered_map<NameId, NameKind>());
       std::size_t n = node(NRangeForStatement), range = node(NRangeDeclaration);
       std::size_t spec = parse_decl_specifier_seq(true); ast_.append(range, spec);
       std::size_t d = parse_declarator(false); ast_.append(range, d);
       std::size_t id = find_identifier_node(d);
-      if (id != none) bind_name(tokens_[id].text, ValueName);
+      if (id != none) bind_name(tokens_[id], ValueName);
       ast_.append(n, range); expect(":");
       std::size_t init = node(NRangeInitializer); ast_.append(init, parse_expression()); ast_.append(n, init);
       expect(")"); ast_.append(n, parse_statement());
@@ -2468,6 +2518,7 @@ private:
   {
     std::size_t lhs = parse_unary();
     for (;;) {
+      if (template_argument_terminator()) break;
       if (template_non_type_default_ && is(">") &&
           (is(",", 1) || is(">", 1) || is(";", 1) || is_keyword("int", 1) ||
            is_keyword("long", 1) || is_keyword("void", 1) || is_keyword("class", 1) ||
@@ -2499,7 +2550,11 @@ private:
       }
       if (consume("(")) {
         if (type_starts_at(0) && !empty_functional_cast_ahead()) ast_.append(n, parse_type_id());
-        else ast_.append(n, parse_expression());
+        else {
+          ++template_expression_nesting_;
+          ast_.append(n, parse_expression());
+          --template_expression_nesting_;
+        }
         expect(")");
       } else ast_.append(n, parse_unary());
       return n;
@@ -2524,6 +2579,9 @@ private:
     const std::size_t saved_pos = pos_;
     const std::size_t saved_nodes = ast_.nodes.size();
     const std::size_t saved_atoms = ast_.composite_atoms.size();
+    const unsigned saved_pending_gt = pending_gt_;
+    const unsigned saved_expression_nesting = template_expression_nesting_;
+    const std::size_t saved_argument_nesting = template_argument_nesting_.size();
     try {
       std::size_t left = take();
       std::size_t type = parse_type_id();
@@ -2534,13 +2592,18 @@ private:
       pos_ = saved_pos;
       ast_.nodes.resize(saved_nodes);
       ast_.composite_atoms.resize(saved_atoms);
+      pending_gt_ = saved_pending_gt;
+      template_expression_nesting_ = saved_expression_nesting;
+      template_argument_nesting_.resize(saved_argument_nesting);
       return none;
     }
   }
   std::size_t parse_keyword_cast()
   {
     std::size_t keyword = take(); expect("<"); std::size_t type = parse_type_id(); expect(">");
-    expect("("); std::size_t expr = parse_expression(); expect(")");
+    expect("("); ++template_expression_nesting_;
+    std::size_t expr = parse_expression();
+    --template_expression_nesting_; expect(")");
     std::size_t n = atom_node(NCastExpression, keyword); ast_.append(n, type); ast_.append(n, expr); return n;
   }
   std::size_t parse_type_trait()
@@ -2549,9 +2612,17 @@ private:
     std::size_t n = atom_node(NTypeTraitExpression, keyword);
     expect("(");
     if (tokens_[keyword].text == "typeid" && (!type_starts_at(0) || empty_functional_cast_ahead()))
+    {
+      ++template_expression_nesting_;
       ast_.append(n, parse_expression());
+      --template_expression_nesting_;
+    }
     else if (tokens_[keyword].text == "noexcept")
+    {
+      ++template_expression_nesting_;
       ast_.append(n, parse_expression());
+      --template_expression_nesting_;
+    }
     else
       ast_.append(n, parse_type_id());
     expect(")"); return n;
@@ -2606,12 +2677,12 @@ private:
     if (!is("(") || !type_starts_at(1)) return false;
     int depth = 1;
     std::size_t i = pos_ + 1;
-    while (i < tokens_.size() && depth) {
+    while (has_token(i) && depth) {
       if (tokens_[i].text == "(") ++depth;
       else if (tokens_[i].text == ")") --depth;
       ++i;
     }
-    if (depth || i >= tokens_.size()) return false;
+    if (depth || !has_token(i)) return false;
     const std::string& after = tokens_[i].text;
     return after == "(" || after == "{" || after == ";" || after == ")" || after == ",";
   }
@@ -2641,8 +2712,8 @@ private:
   {
     if (!is_identifier()) return false;
     std::size_t i = pos_ + 1;
-    if (i < tokens_.size() && tokens_[i].text == "::") return true;
-    if (i >= tokens_.size() || tokens_[i].text != "<") return false;
+    if (has_token(i) && tokens_[i].text == "::") return true;
+    if (!has_token(i) || tokens_[i].text != "<") return false;
     int angles = 0, parens = 0, brackets = 0, braces = 0;
     do {
       const std::string& text = tokens_[i].text;
@@ -2657,8 +2728,8 @@ private:
       else if (!parens && !brackets && !braces && text == ">>" && angles)
         angles = angles >= 2 ? angles - 2 : 0;
       ++i;
-    } while (i < tokens_.size() && angles > 0);
-    return angles == 0 && i < tokens_.size() && tokens_[i].text == "::";
+    } while (has_token(i) && angles > 0);
+    return angles == 0 && has_token(i) && tokens_[i].text == "::";
   }
   std::size_t parse_postfix_suffix(std::size_t base)
   {
@@ -2669,8 +2740,10 @@ private:
             ast_.tokens[ast_.nodes[base].atom].category == KeywordToken;
         std::size_t args = node(type_call ? NParenArgumentList : NArgumentList);
         if (!consume(")")) {
+          ++template_expression_nesting_;
           do { ast_.append(args, parse_assignment()); } while (consume(","));
           expect(")");
+          --template_expression_nesting_;
         }
         ast_.append(call, args); base = call; continue;
       }
@@ -2680,31 +2753,57 @@ private:
       }
       if (consume("[")) {
         std::size_t sub = node(NSubscriptExpression); ast_.append(sub, base);
-        ast_.append(sub, parse_expression()); expect("]"); base = sub; continue;
+        ++template_expression_nesting_;
+        ast_.append(sub, parse_expression()); expect("]");
+        --template_expression_nesting_;
+        base = sub; continue;
       }
       if (is(".") || is("->")) {
         std::size_t op = take();
         std::size_t member = atom_node(NMemberExpression, op); ast_.append(member, base);
-        std::string name;
+        ParsedName name;
         const bool explicit_template = is_keyword("template");
-        if (explicit_template) { name = "template "; take(); }
+        if (explicit_template) { name.spelling = "template "; take(); }
         if (is("~")) {
           take();
           if (!is_identifier()) fail("expected destructor name");
-          name += "~" + tokens_[take()].text;
+          const std::size_t component = take();
+          name.spelling += "~" + tokens_[component].text;
+          name.first_token = name.source_token = component;
+          add_name_component(name, component);
         } else if (is_keyword("operator")) {
-          name += parse_operator_name();
+          const std::size_t operator_token = pos_;
+          name.spelling += parse_operator_name();
+          name.operator_tokens_begin = operator_token;
+          name.operator_tokens_end = pos_;
+          name.first_token = name.source_token = operator_token;
+          add_name_component(name, operator_token);
+          if (explicit_template && is("<")) { take(); read_template_suffix(name); }
         } else {
           if (!is_identifier()) fail("expected member name");
           if (explicit_template) {
-            name += tokens_[take()].text;
-            if (is("<")) { take(); name = read_template_suffix(name); }
-          } else if (qualified_member_id_ahead()) name += joined_name();
-          else name += tokens_[take()].text;
+            const std::size_t component = take();
+            name.spelling += tokens_[component].text;
+            name.first_token = name.source_token = component;
+            add_name_component(name, component);
+            if (is("<")) { take(); read_template_suffix(name); }
+          } else if (qualified_member_id_ahead()) {
+            name = joined_name();
+          } else {
+            const std::size_t component = take();
+            name.spelling = tokens_[component].text;
+            name.first_token = name.source_token = component;
+          }
         }
-        if (name.empty())
-          ast_.append(member, composite_node(NIdentifier, parse_operator_name()));
-        else ast_.append(member, composite_node(NIdentifier, name));
+        if (name.spelling.empty()) {
+          const std::size_t operator_token = pos_;
+          name.spelling = parse_operator_name();
+          name.operator_tokens_begin = operator_token;
+          name.operator_tokens_end = pos_;
+          name.first_token = name.source_token = operator_token;
+          add_name_component(name, operator_token);
+        }
+        ast_.append(member, composite_node(NIdentifier, name));
         base = member; continue;
       }
       if (is("++") || is("--")) {
@@ -2722,10 +2821,15 @@ private:
       return atom_node(NKeywordLiteral, take());
     if (is_keyword("this")) return atom_node(NKeywordLiteral, take());
     if (is_keyword("operator")) {
-      std::string name = parse_operator_name();
-      const std::size_t space = name.find("operator ");
-      if (space == 0) name.erase(8, 1);
-      if (is("<")) { take(); name = read_template_suffix(name); }
+      const std::size_t operator_token = pos_;
+      ParsedName name;
+      name.operator_tokens_begin = operator_token;
+      name.spelling = parse_operator_name();
+      name.operator_tokens_end = pos_;
+      name.first_token = name.source_token = operator_token;
+      const std::size_t space = name.spelling.find("operator ");
+      if (space == 0) name.spelling.erase(8, 1);
+      if (is("<")) { take(); read_template_suffix(name); }
       return composite_node(NIdExpression, name);
     }
     if (is_keyword("typename")) {
@@ -2737,14 +2841,18 @@ private:
     if (is("[")) return parse_lambda_expression();
     if (is_builtin_type() && is("(", 1)) return atom_node(NIdExpression, take());
     if (is_identifier() || is("::")) {
-      std::string name = joined_name();
-      if (is("<") && template_id_candidate(name)) {
-        take(); name = read_template_suffix(name);
+      ParsedName name = joined_name();
+      if (is("<") && template_id_candidate(name.spelling)) {
+        take(); read_template_suffix(name);
       }
       return composite_node(NIdExpression, name);
     }
     if (consume("(")) {
-      std::size_t n = node(NParenthesizedExpression); ast_.append(n, parse_expression()); expect(")"); return n;
+      std::size_t n = node(NParenthesizedExpression);
+      ++template_expression_nesting_;
+      ast_.append(n, parse_expression()); expect(")");
+      --template_expression_nesting_;
+      return n;
     }
     if (is("{")) return parse_braced_init();
     fail("expected expression");
@@ -2760,7 +2868,7 @@ private:
     capture += "]";
     std::size_t lambda = node(NLambdaExpression);
     ast_.append(lambda, composite_node(NLambdaIntroducer, capture));
-    names_.scopes.push_back(std::unordered_map<std::string, NameKind>());
+    names_.scopes.push_back(std::unordered_map<NameId, NameKind>());
     if (is("(") || is_keyword("mutable") || is_keyword("noexcept") || is("->")) {
       std::size_t declarator = node(NLambdaDeclarator);
       if (is("(")) ast_.append(declarator, parse_parameter_clause());
@@ -2781,11 +2889,15 @@ private:
     return lambda;
   }
 
-  Ast ast_;
-  const std::vector<Token>& tokens_;
+  Ast& ast_;
+  std::vector<Token>& tokens_;
+  PreprocessedTokenCursor& cursor_;
   std::size_t pos_;
   unsigned pending_gt_;
   unsigned template_non_type_default_;
+  unsigned template_expression_nesting_;
+  std::vector<unsigned> template_argument_nesting_;
+  mutable bool input_finished_;
   ParserNameState names_;
   std::vector<std::string> namespace_path_;
   std::vector<bool> namespace_inline_;
@@ -2793,60 +2905,6 @@ private:
   std::vector<std::size_t> class_scope_indices_;
 };
 
-bool has_token(NodeKind kind)
-{
-  return kind == NDeclSpecifier || kind == NIdentifier || kind == NIdExpression ||
-      kind == NLiteral || kind == NKeywordLiteral || kind == NBinaryExpression ||
-      kind == NAssignmentExpression || kind == NUnaryExpression || kind == NPostfixExpression ||
-      kind == NMemberExpression || kind == NPtrOperator || kind == NCvQualifier ||
-      kind == NRefQualifier || kind == NCastExpression || kind == NTypeTraitExpression ||
-      kind == NLambdaSpecifier || kind == NVirtSpecifier || kind == NGotoStatement ||
-      kind == NLabeledStatement || kind == NSpecifier || kind == NPackExpansion ||
-      kind == NTaggedLiteral;
-}
-
-void PrintNode(const Ast& ast, std::size_t id, std::size_t depth, std::ostream& out)
-{
-  const AstNode& n = ast.nodes[id];
-  out << std::string(depth * 2, ' ') << NodeName(n.kind);
-  if (n.composite != none) out << ' ' << ast.composite_atoms[n.composite];
-  else if (n.atom != none && has_token(n.kind)) {
-    const Token& t = ast.tokens[n.atom];
-    if (n.kind == NIdentifier || n.kind == NIdExpression || n.kind == NLiteral ||
-        n.kind == NGotoStatement || n.kind == NLabeledStatement)
-      out << ' ' << t.text;
-    else if (n.kind == NVirtSpecifier)
-      out << " TT_IDENTIFIER:" << t.text;
-    else if (n.kind == NSpecifier && t.text == "explicit")
-      out << ' ' << t.text;
-    else if (n.kind == NCastExpression && t.tag == "OP_LPAREN")
-      out << " OP_LPAREN:";
-    else
-      out << ' ' << t.tag << ':' << t.text;
-  }
-  if (n.atom != none && (n.kind == NClassKey || n.kind == NEnumKey || n.kind == NParameterKey ||
-      n.kind == NTypeSpecifier || n.kind == NAccessSpecifier || n.kind == NVirtualBase)) {
-    const Token& t = ast.tokens[n.atom];
-    out << ' ' << t.tag << ':' << t.text;
-  }
-  if (n.atom != none && n.kind == NEnumerator) out << ' ' << ast.tokens[n.atom].text;
-  if (n.atom != none && (n.kind == NAliasDeclaration || n.kind == NNamespaceAliasDefinition))
-    out << ' ' << ast.tokens[n.atom].text;
-  if (n.atom != none && (n.kind == NSpecialMemberDeclaration || n.kind == NSpecialMemberDefinition))
-    out << ' ' << ast.tokens[n.atom].text;
-  if (n.atom != none && n.kind == NSpecialInitializer) out << ' ' << ast.tokens[n.atom].text;
-  if (n.atom != none && n.kind == NParameterPack) out << " ...";
-  if (n.atom != none && n.kind == NEllipsis) out << " ...";
-  if (n.kind == NNamespaceDefinition) {
-    if (n.atom == none) out << " <unnamed>";
-    else out << ' ' << ast.tokens[n.atom].text;
-  }
-  if (n.kind == NStaticAssertDeclaration && n.atom != none) out << ' ' << ast.tokens[n.atom].text;
-  if (n.kind == NMessage && n.atom != none) out << ' ' << ast.tokens[n.atom].text;
-  out << '\n';
-  for (std::size_t c = n.first_child; c != none; c = ast.nodes[c].next_sibling)
-    PrintNode(ast, c, depth + 1, out);
-}
 
 std::string ReadFile(const std::string& path)
 {
@@ -2877,22 +2935,25 @@ std::pair<std::string, std::string> BuildDateAndTime()
                         std::string(text + 11, 8));
 }
 
-Ast ParseSource(const std::string& path)
+}  // namespace
+
+Ast ParseTranslationUnitSource(const std::string& source, const std::string& path)
 {
-  std::string source = ReadFile(path);
-  std::vector<Token> tokens;
-  TokenSink sink(tokens);
-  PreprocessingMetadata metadata;
-  std::pair<std::string, std::string> time = BuildDateAndTime();
-  bool preprocessed = PreprocessTranslationUnit(source, path, sink, metadata, time.first, time.second);
-  if (!preprocessed || !sink.valid)
-    throw std::runtime_error("preprocessing failed: " + path +
-        (sink.failure.empty() ? std::string() : ": " + sink.failure));
-  Parser parser(std::move(tokens));
+  Ast ast;
+  const std::pair<std::string, std::string> time = BuildDateAndTime();
+  // The cursor must join before ast releases metadata referenced by its worker.
+  PreprocessedTokenCursor cursor(source, path, ast.preprocessing_metadata(),
+                                 time.first, time.second);
+  Parser parser(ast, cursor);
   return parser.Parse();
 }
 
-}  // namespace
+Ast ParseTranslationUnit(const std::string& path)
+{
+  const std::string source = ReadFile(path);
+  return ParseTranslationUnitSource(source, path);
+}
+
 
 void EmitAst(const std::vector<std::string>& inputs, const std::string& output)
 {
@@ -2900,10 +2961,9 @@ void EmitAst(const std::vector<std::string>& inputs, const std::string& output)
   if (!out) throw std::runtime_error("unable to open output file: " + output);
   out << inputs.size() << " translation units\n";
   for (std::size_t i = 0; i < inputs.size(); ++i) {
-    Ast ast = ParseSource(inputs[i]);
+    Ast ast = ParseTranslationUnit(inputs[i]);
     out << "start translation unit " << (i + 1) << '\n';
-    if (ast.nodes.empty()) throw std::runtime_error("internal empty AST");
-    PrintNode(ast, 0, 0, out);
+    PrintAst(ast, out);
     out << "end translation unit\n";
     if (!out) throw std::runtime_error("failed to write AST output");
   }

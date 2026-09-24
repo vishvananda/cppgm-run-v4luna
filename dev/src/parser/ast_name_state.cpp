@@ -5,7 +5,7 @@
 namespace cppgm {
 
 ParserNameState::UndoEntry::UndoEntry()
-    : kind(UndoScopeName), scope(0), existed(false), owner_existed(false),
+    : kind(UndoScopeName), scope(0), name_id(0), existed(false), owner_existed(false),
       old_kind(UnknownName), old_size(0)
 {}
 
@@ -29,8 +29,8 @@ void ParserNameState::rollback_transaction(std::size_t mark)
     const UndoEntry& entry = undo_log_.back();
     if (entry.kind == UndoScopeName) {
       if (entry.scope < scopes.size()) {
-        if (entry.existed) scopes[entry.scope][entry.key] = entry.old_kind;
-        else scopes[entry.scope].erase(entry.key);
+        if (entry.existed) scopes[entry.scope][entry.name_id] = entry.old_kind;
+        else scopes[entry.scope].erase(entry.name_id);
       }
     } else if (entry.kind == UndoQualifiedName) {
       restore_qualified_name(entry.key, entry.existed, entry.old_kind);
@@ -38,11 +38,11 @@ void ParserNameState::rollback_transaction(std::size_t mark)
       if (entry.existed) namespace_aliases[entry.key] = entry.old_string;
       else namespace_aliases.erase(entry.key);
     } else if (entry.kind == UndoClassMember) {
-      std::unordered_map<std::string, std::unordered_map<std::string, NameKind> >::iterator group =
+      std::unordered_map<std::string, std::unordered_map<NameId, NameKind> >::iterator group =
           class_members.find(entry.owner);
       if (group != class_members.end()) {
-        if (entry.existed) group->second[entry.key] = entry.old_kind;
-        else group->second.erase(entry.key);
+        if (entry.existed) group->second[entry.name_id] = entry.old_kind;
+        else group->second.erase(entry.name_id);
         if (!entry.owner_existed && group->second.empty()) class_members.erase(group);
       }
     } else if (entry.kind == UndoClassBases) {
@@ -61,12 +61,12 @@ void ParserNameState::rollback_transaction(std::size_t mark)
 void ParserNameState::record_undo(UndoEntry&& entry)
 { if (transaction_depth_) undo_log_.push_back(std::move(entry)); }
 
-void ParserNameState::set_scope_name(std::size_t scope, const std::string& key, NameKind value)
+void ParserNameState::set_scope_name(std::size_t scope, NameId key, NameKind value)
 {
-  std::unordered_map<std::string, NameKind>& names = scopes[scope];
-  std::unordered_map<std::string, NameKind>::const_iterator old = names.find(key);
+  std::unordered_map<NameId, NameKind>& names = scopes[scope];
+  std::unordered_map<NameId, NameKind>::const_iterator old = names.find(key);
   if (old != names.end() && old->second == value) return;
-  UndoEntry entry; entry.kind = UndoScopeName; entry.scope = scope; entry.key = key;
+  UndoEntry entry; entry.kind = UndoScopeName; entry.scope = scope; entry.name_id = key;
   entry.existed = old != names.end();
   if (entry.existed) entry.old_kind = old->second;
   record_undo(std::move(entry));
@@ -115,14 +115,14 @@ void ParserNameState::set_namespace_alias(const std::string& key, const std::str
   namespace_aliases[key] = value;
 }
 
-void ParserNameState::set_class_member(const std::string& owner, const std::string& key, NameKind value)
+void ParserNameState::set_class_member(const std::string& owner, NameId key, NameKind value)
 {
-  std::unordered_map<std::string, std::unordered_map<std::string, NameKind> >::const_iterator group =
+  std::unordered_map<std::string, std::unordered_map<NameId, NameKind> >::const_iterator group =
       class_members.find(owner);
-  std::unordered_map<std::string, NameKind>::const_iterator old;
+  std::unordered_map<NameId, NameKind>::const_iterator old;
   if (group != class_members.end()) old = group->second.find(key);
   if (group != class_members.end() && old != group->second.end() && old->second == value) return;
-  UndoEntry entry; entry.kind = UndoClassMember; entry.owner = owner; entry.key = key;
+  UndoEntry entry; entry.kind = UndoClassMember; entry.owner = owner; entry.name_id = key;
   entry.owner_existed = group != class_members.end();
   entry.existed = entry.owner_existed && old != group->second.end();
   if (entry.existed) entry.old_kind = old->second;

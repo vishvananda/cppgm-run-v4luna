@@ -14,6 +14,20 @@ translation-unit
         call-expression prvalue void
           callee select function of (int) returning void
           literal prvalue int 3
+  function-definition use_distinct_template_arguments function of () returning void
+    compound-statement
+      expression-statement
+        call-expression prvalue void
+          callee mark function of (int) returning void
+          literal prvalue int 1
+      expression-statement
+        call-expression prvalue void
+          callee mark function of (int) returning void
+          literal prvalue int 2
   function-declaration identity function of (int) returning int
+    parameter value int
+  function-declaration mark function of (int) returning void
+    parameter value int
+  function-declaration mark function of (int) returning void
     parameter value int
 end translation unit

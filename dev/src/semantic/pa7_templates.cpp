@@ -154,11 +154,22 @@ void IndexNamespaceFunctionTemplates(const pa6::SemanticUnit& unit,
   }
 }
 
+std::size_t TypeArgumentVectorHash::operator()(
+    const std::vector<pa6::Id>& arguments) const
+{
+  std::size_t result = arguments.size();
+  for (std::size_t i = 0; i < arguments.size(); ++i)
+    result ^= std::hash<Id>()(arguments[i]) + 0x9e3779b9U + (result << 6) + (result >> 2);
+  return result;
+}
+
 Id InstantiateFunctionTemplateType(pa6::SemanticUnit& unit, Id primary,
                                    const std::vector<Id>& explicit_types,
                                    const std::vector<Id>& argument_types,
-                                   bool deduce_from_arguments)
+                                   bool deduce_from_arguments,
+                                   std::vector<Id>& specialization_arguments)
 {
+  specialization_arguments.clear();
   if (primary >= unit.binding_count() ||
       unit.binding(primary).kind != pa6::FunctionBinding) return none;
   const pa6::Binding& declaration = unit.binding(primary);
@@ -203,6 +214,9 @@ Id InstantiateFunctionTemplateType(pa6::SemanticUnit& unit, Id primary,
     }
   }
   if (substitutions.size() != parameters.size()) return none;
+  for (std::size_t i = 0; i < parameters.size(); ++i)
+    specialization_arguments.push_back(
+        substitutions[unit.type(parameters[i]).declaration]);
   const Id result = substitute(unit, pattern_id, substitutions);
   std::unordered_set<Id> visited;
   if (result == none || has_parameter(unit, result, visited)) return none;

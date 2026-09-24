@@ -11,6 +11,15 @@ namespace pa7 {
 typedef std::unordered_map<pa6::Id,
     std::unordered_map<pa6::Id, std::vector<pa6::Id> > > FunctionTemplateIndex;
 
+struct TypeArgumentVectorHash
+{
+  std::size_t operator()(const std::vector<pa6::Id>& arguments) const;
+};
+
+typedef std::unordered_map<pa6::Id,
+    std::unordered_map<std::vector<pa6::Id>, pa6::Id,
+                       TypeArgumentVectorHash> > FunctionTemplateInstances;
+
 void IndexNamespaceFunctionTemplates(const pa6::SemanticUnit& unit,
                                      FunctionTemplateIndex& index);
 
@@ -21,7 +30,8 @@ pa6::Id InstantiateFunctionTemplateType(
     pa6::SemanticUnit& unit, pa6::Id primary,
     const std::vector<pa6::Id>& explicit_types,
     const std::vector<pa6::Id>& argument_types,
-    bool deduce_from_arguments);
+    bool deduce_from_arguments,
+    std::vector<pa6::Id>& specialization_arguments);
 
 bool ExplicitFunctionTemplateTypes(
     pa6::SemanticUnit& unit, const Ast& ast, pa6::Id scope, pa6::Id node,

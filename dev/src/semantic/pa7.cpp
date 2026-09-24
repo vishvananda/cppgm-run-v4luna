@@ -150,7 +150,7 @@ private:
   std::vector<Id> instantiated_function_origins_;
   std::vector<Id> demanded_function_instances_;
   std::unordered_set<Id> demanded_function_instance_set_;
-  std::unordered_map<Id, std::unordered_map<Id, Id> > function_instances_;
+  pa7::FunctionTemplateInstances function_instances_;
   pa7::FunctionTemplateIndex function_template_index_;
   std::unordered_map<Id, std::string> anonymous_type_names_;
 
@@ -213,12 +213,17 @@ private:
       for (std::size_t i = 0; i < arguments->size(); ++i)
         argument_types.push_back((*arguments)[i].type);
     }
+    std::vector<Id> specialization_arguments;
     Id specialized = pa7::InstantiateFunctionTemplateType(
-        unit_, primary, explicit_types, argument_types, arguments != 0);
+        unit_, primary, explicit_types, argument_types, arguments != 0,
+        specialization_arguments);
     if (specialized == none) return none;
     specialized = canonical_function(specialized);
-    std::unordered_map<Id, Id>& instances = function_instances_[primary];
-    const std::unordered_map<Id, Id>::const_iterator cached = instances.find(specialized);
+    std::unordered_map<std::vector<Id>, Id, pa7::TypeArgumentVectorHash>& instances =
+        function_instances_[primary];
+    const std::unordered_map<std::vector<Id>, Id,
+        pa7::TypeArgumentVectorHash>::const_iterator cached =
+            instances.find(specialization_arguments);
     if (cached != instances.end()) return cached->second;
     pa6::Binding instance = unit_.binding(primary);
     instance.type = specialized;
@@ -227,7 +232,7 @@ private:
     const Id id = unit_.binding_count() + instantiated_function_bindings_.size();
     instantiated_function_bindings_.push_back(instance);
     instantiated_function_origins_.push_back(primary);
-    instances[specialized] = id;
+    instances[specialization_arguments] = id;
     return id;
   }
 

@@ -1,4 +1,6 @@
 #include "semantic/pa6.h"
+#include "semantic/pa7_ast.h"
+#include "semantic/pa7_lookup.h"
 #include "semantic/pa7_templates.h"
 
 #include <algorithm>
@@ -59,7 +61,7 @@ struct CallFact
 
 struct Environment
 {
-  std::unordered_map<std::string, std::vector<Id> > names;
+  std::unordered_map<Id, std::vector<Id> > names;
   std::vector<Id> using_directives;
 };
 
@@ -82,12 +84,14 @@ class SemanticDumper
 {
 public:
   explicit SemanticDumper(pa6::SemanticUnit& unit)
-      : unit_(unit), ast_(unit.ast()), current_scope_(unit.global_scope()),
+      : unit_(unit), ast_(unit.ast()), visibility_(unit),
+        current_scope_(unit.global_scope()),
         current_function_type_(none), loop_depth_(0), switch_depth_(0),
         analysis_depth_(0)
   {
     facts_.resize(ast_.nodes.size());
     fact_ready_.assign(ast_.nodes.size(), false);
+    call_facts_.reset();
     pa7::IndexNamespaceFunctionTemplates(unit_, function_template_index_);
     index_anonymous_types();
   }
@@ -96,14 +100,7 @@ public:
   {
     out_ = &out;
     out << "translation-unit\n";
-    for (Id node = 0; node < ast_.nodes.size(); ++node) {
-      if (ast_.nodes[node].kind != NFunctionDefinition) continue;
-      const Id binding = unit_.binding_for_node(node);
-      if (binding == none || binding >= unit_.binding_count()) continue;
-      const pa6::Binding& function = unit_.binding(binding);
-      if (unit_.scope(function.scope).kind == pa6::ClassScope)
-        member_definition_nodes_[binding] = node;
-    }
+    index_function_definitions_and_templates();
     for (Id c = ast_.nodes[0].first_child; c != none; c = ast_.nodes[c].next_sibling)
       emit_declaration(c, 1);
     for (std::size_t i = 0; i < demanded_member_definitions_.size(); ++i) {
@@ -112,7 +109,7 @@ public:
           member_definition_nodes_.find(binding);
       if (definition == member_definition_nodes_.end()) continue;
       const Id entity = unit_.binding(binding).entity;
-      if (defined_functions_.find(entity) != defined_functions_.end()) continue;
+      if (defined_functions_.contains(entity)) continue;
       emit_function(definition->second, 1);
     }
     for (std::size_t i = 0; i < demanded_function_instances_.size(); ++i)
@@ -126,6 +123,7 @@ private:
   pa6::SemanticUnit& unit_;
   const Ast& ast_;
   std::ostream* out_;
+  pa7::SourceVisibility visibility_;
   Id current_scope_;
   Id current_function_type_;
   std::vector<Environment> environments_;
@@ -135,21 +133,22 @@ private:
   unsigned analysis_depth_;
   std::vector<ExpressionFact> facts_;
   std::vector<bool> fact_ready_;
-  std::unordered_map<Id, CallFact> calls_;
+  pa7::NodeFactTable<CallFact> call_facts_;
   std::unordered_map<Id, Id> canonical_functions_;
   std::unordered_map<Id, std::pair<Id, std::string> > injected_union_members_;
-  std::unordered_set<Id> defined_functions_;
-  std::unordered_map<Id, std::unordered_map<std::string, pa6::BindingKind> >
+  pa7::FlatIdSet defined_functions_;
+  std::unordered_map<Id, std::unordered_map<Id, pa6::BindingKind> >
       namespace_ordinary_kinds_;
   std::vector<GeneratedUnionConstructor> generated_union_constructors_;
   std::vector<GeneratedUnionConstructor> translation_unit_constructors_;
   std::unordered_map<Id, Id> member_definition_nodes_;
   std::vector<Id> demanded_member_definitions_;
-  std::unordered_set<Id> demanded_member_set_;
+  pa7::FlatIdSet demanded_member_set_;
+  std::unordered_map<Id, Id> template_declarators_;
   std::vector<pa6::Binding> instantiated_function_bindings_;
   std::vector<Id> instantiated_function_origins_;
   std::vector<Id> demanded_function_instances_;
-  std::unordered_set<Id> demanded_function_instance_set_;
+  pa7::FlatIdSet demanded_function_instance_set_;
   pa7::FunctionTemplateInstances function_instances_;
   pa7::FunctionTemplateIndex function_template_index_;
   std::unordered_map<Id, std::string> anonymous_type_names_;
@@ -214,17 +213,24 @@ private:
         argument_types.push_back((*arguments)[i].type);
     }
     std::vector<Id> specialization_arguments;
+    if (!pa7::ResolveFunctionTemplateArguments(
+            unit_, primary, explicit_types, argument_types, arguments != 0,
+            specialization_arguments)) return none;
+    std::unordered_map<Id, std::unordered_map<std::vector<Id>, Id,
+        pa7::TypeArgumentVectorHash> >::const_iterator template_instances =
+            function_instances_.find(primary);
+    if (template_instances != function_instances_.end()) {
+      const std::unordered_map<std::vector<Id>, Id,
+          pa7::TypeArgumentVectorHash>::const_iterator cached =
+              template_instances->second.find(specialization_arguments);
+      if (cached != template_instances->second.end()) return cached->second;
+    }
     Id specialized = pa7::InstantiateFunctionTemplateType(
-        unit_, primary, explicit_types, argument_types, arguments != 0,
-        specialization_arguments);
+        unit_, primary, specialization_arguments);
     if (specialized == none) return none;
     specialized = canonical_function(specialized);
     std::unordered_map<std::vector<Id>, Id, pa7::TypeArgumentVectorHash>& instances =
         function_instances_[primary];
-    const std::unordered_map<std::vector<Id>, Id,
-        pa7::TypeArgumentVectorHash>::const_iterator cached =
-            instances.find(specialization_arguments);
-    if (cached != instances.end()) return cached->second;
     pa6::Binding instance = unit_.binding(primary);
     instance.type = specialized;
     instance.output = false;
@@ -238,7 +244,7 @@ private:
 
   void demand_function_instance(Id id)
   {
-    if (is_instantiated_binding(id) && demanded_function_instance_set_.insert(id).second)
+    if (is_instantiated_binding(id) && demanded_function_instance_set_.insert(id))
       demanded_function_instances_.push_back(id);
   }
 
@@ -553,119 +559,72 @@ private:
     return qualified_name(scope, selected.name);
   }
 
-  std::vector<std::string> split_name(const std::string& spelling,
-                                      bool& absolute) const
-  {
-    std::vector<std::string> parts;
-    absolute = spelling.compare(0, 2, "::") == 0;
-    std::size_t start = absolute ? 2 : 0;
-    while (start < spelling.size()) {
-      std::size_t end = spelling.find("::", start);
-      if (end == std::string::npos) end = spelling.size();
-      std::string part = spelling.substr(start, end - start);
-      std::size_t angle = part.find('<');
-      if (angle != std::string::npos) part.erase(angle);
-      if (!part.empty()) parts.push_back(part);
-      if (end == spelling.size()) break;
-      start = end + 2;
-    }
-    return parts;
-  }
-
   std::string node_name(Id node) const { return text(node); }
 
-  void add_unique(std::vector<Id>& result, Id binding) const
-  {
-    if (binding == none) return;
-    const pa6::Binding& candidate = this->binding(binding);
-    for (std::size_t i = 0; i < result.size(); ++i) {
-      const pa6::Binding& old = this->binding(result[i]);
-      if (result[i] == binding ||
-          (old.kind == pa6::FunctionBinding && candidate.kind == pa6::FunctionBinding &&
-           old.entity == candidate.entity)) return;
-    }
-    result.push_back(binding);
-  }
-
-  std::vector<Id> direct_bindings(Id scope, const std::string& name,
+  std::vector<Id> direct_bindings(Id scope, Id name,
                                   bool namespaces_only = false,
                                   bool types_only = false) const
   {
-    std::vector<Id> result;
-    if (scope == none || scope >= unit_.scope_count()) return result;
+    pa7::BindingCandidates result;
+    if (scope == none || scope >= unit_.scope_count()) return std::vector<Id>();
     const pa6::ScopeRecord& record = unit_.scope(scope);
-    for (std::size_t i = 0; i < record.bindings.size(); ++i) {
-      const Id id = record.bindings[i];
-      const pa6::Binding& b = unit_.binding(id);
-      if (b.name != name) continue;
-      const bool ns = b.kind == pa6::NamespaceBinding;
-      const bool ty = b.kind == pa6::TypeBinding || b.kind == pa6::AliasBinding ||
-          b.kind == pa6::TemplateNameBinding;
-      if (namespaces_only && !ns) continue;
-      if (types_only && !ty) continue;
-      if (!namespaces_only && !types_only && ns) continue;
-      add_unique(result, id);
+    const std::vector<Id> indexed = unit_.lookup_bindings(
+        scope, name, false, namespaces_only);
+    if (types_only) {
+      Id latest = none;
+      for (std::size_t i = 0; i < indexed.size(); ++i)
+        if (visibility_.binding_visible(unit_, scope, indexed[i])) latest = indexed[i];
+      if (latest == none && !namespaces_only) {
+        const std::vector<Id> namespace_bindings = unit_.lookup_bindings(
+            scope, name, false, true);
+        for (std::size_t i = 0; i < namespace_bindings.size(); ++i)
+          if (visibility_.binding_visible(unit_, scope, namespace_bindings[i]))
+            latest = namespace_bindings[i];
+      }
+      if (latest != none) {
+        result.add(unit_, latest);
+      }
+    } else {
+      for (std::size_t i = 0; i < indexed.size(); ++i)
+        if (visibility_.binding_visible(unit_, scope, indexed[i])) result.add(unit_, indexed[i]);
     }
     if (!namespaces_only && !types_only && record.kind == pa6::NamespaceScope) {
       const pa7::FunctionTemplateIndex::const_iterator indexed_scope =
           function_template_index_.find(scope);
       if (indexed_scope != function_template_index_.end()) {
-        const Id name_identity = ast_.find_name(name);
         const std::unordered_map<Id, std::vector<Id> >::const_iterator functions =
-            indexed_scope->second.find(name_identity);
+          indexed_scope->second.find(name);
         if (functions != indexed_scope->second.end())
           for (std::size_t i = 0; i < functions->second.size(); ++i)
-            add_unique(result, functions->second[i]);
+            if (visibility_.is_visible(functions->second[i]))
+              result.add(unit_, functions->second[i]);
       }
     }
-    return result;
+    return result.release();
   }
 
-  void collect_class_members(Id entity, const std::string& name,
-                             std::unordered_set<Id>& visited,
+  void collect_class_members(Id entity, Id name,
+                             pa7::FlatIdSet& visited,
                              std::vector<Id>& result) const
   {
-    if (entity == none || entity >= unit_.entity_count() || !visited.insert(entity).second)
+    if (entity == none || entity >= unit_.entity_count() || !visited.insert(entity))
       return;
     const pa6::Entity& record = unit_.entity(entity);
     if (record.scope == none) return;
     const std::vector<Id> direct = direct_bindings(record.scope, name);
     if (!direct.empty()) {
-      for (std::size_t i = 0; i < direct.size(); ++i) add_unique(result, direct[i]);
+      result.insert(result.end(), direct.begin(), direct.end());
       return;
     }
     for (std::size_t i = 0; i < record.bases.size(); ++i)
       collect_class_members(record.bases[i], name, visited, result);
   }
 
-  Id named_base_entity(Id entity, const std::string& qualifier) const
-  {
-    std::unordered_set<Id> visited;
-    std::vector<Id> pending(1, entity);
-    while (!pending.empty()) {
-      const Id current = pending.back();
-      pending.pop_back();
-      if (current == none || current >= unit_.entity_count() ||
-          !visited.insert(current).second) continue;
-      const pa6::Entity& record = unit_.entity(current);
-      for (std::size_t i = 0; i < record.bases.size(); ++i) {
-        const Id base = record.bases[i];
-        const pa6::Entity& base_record = unit_.entity(base);
-        const Id parent = base_record.scope == none ? none : unit_.scope(base_record.scope).parent;
-        const std::string full = parent == none ? base_record.name
-            : qualified_name(parent, base_record.name);
-        if (base_record.name == qualifier || full == qualifier) return base;
-        pending.push_back(base);
-      }
-    }
-    return none;
-  }
-
   bool derives_from(Id derived, Id base,
-                    std::unordered_set<Id>& visited) const
+                    pa7::FlatIdSet& visited) const
   {
     if (derived == base) return true;
-    if (derived == none || derived >= unit_.entity_count() || !visited.insert(derived).second)
+    if (derived == none || derived >= unit_.entity_count() || !visited.insert(derived))
       return false;
     const std::vector<Id>& bases = unit_.entity(derived).bases;
     for (std::size_t i = 0; i < bases.size(); ++i)
@@ -686,7 +645,7 @@ private:
     const Id source_entity = type(source_base).entity;
     const Id target_entity = type(target_base).entity;
     if (source_entity == target_entity) return false;
-    std::unordered_set<Id> visited;
+    pa7::FlatIdSet visited;
     if (!derives_from(source_entity, target_entity, visited)) return false;
     if (added_cv)
       *added_cv = (!source_const && target_const) ||
@@ -694,59 +653,54 @@ private:
     return true;
   }
 
-  void collect_directive_scope(Id scope, const std::string& name,
-                               std::unordered_set<Id>& visited,
-                               std::vector<Id>& result,
+  void collect_directive_scope(Id scope, Id name,
+                               pa7::FlatIdSet& visited,
+                               pa7::BindingCandidates& result,
                                bool namespaces_only = false,
                                bool types_only = false) const
   {
-    if (scope == none || !visited.insert(scope).second) return;
+    if (scope == none || !visited.insert(scope)) return;
     std::vector<Id> local = direct_bindings(scope, name, namespaces_only, types_only);
     if (!local.empty()) {
-      for (std::size_t i = 0; i < local.size(); ++i) add_unique(result, local[i]);
+      for (std::size_t i = 0; i < local.size(); ++i) result.add(unit_, local[i]);
       return;
     }
-    const pa6::ScopeRecord& record = unit_.scope(scope);
-    for (std::size_t i = 0; i < record.using_directives.size(); ++i)
-      collect_directive_scope(record.using_directives[i], name, visited, result,
-                              namespaces_only, types_only);
-    for (std::size_t i = 0; i < record.children.size(); ++i) {
-      const Id child = record.children[i];
-      if (unit_.scope(child).kind == pa6::NamespaceScope &&
-          unit_.scope(child).inline_namespace)
-        collect_directive_scope(child, name, visited, result,
-                                namespaces_only, types_only);
-    }
+    const std::vector<Id>& directives = visibility_.using_directives(scope);
+    for (std::size_t i = 0; i < directives.size(); ++i)
+        collect_directive_scope(directives[i], name, visited,
+                                result, namespaces_only, types_only);
+    const std::vector<Id>& inlines = visibility_.inline_namespaces(scope);
+    for (std::size_t i = 0; i < inlines.size(); ++i)
+        collect_directive_scope(inlines[i], name, visited,
+                                result, namespaces_only, types_only);
   }
 
-  std::vector<Id> lookup_namespace_scope(Id scope, const std::string& name,
+  std::vector<Id> lookup_namespace_scope(Id scope, Id name,
                                          bool namespaces_only = false,
                                          bool types_only = false) const
   {
     std::vector<Id> direct = direct_bindings(scope, name, namespaces_only, types_only);
     if (!direct.empty()) return direct;
-    std::unordered_set<Id> visited;
-    std::vector<Id> result;
-    const pa6::ScopeRecord& record = unit_.scope(scope);
-    for (std::size_t i = 0; i < record.using_directives.size(); ++i)
-      collect_directive_scope(record.using_directives[i], name, visited, result,
-                              namespaces_only, types_only);
-    for (std::size_t i = 0; i < record.children.size(); ++i) {
-      const Id child = record.children[i];
-      if (unit_.scope(child).kind == pa6::NamespaceScope && unit_.scope(child).inline_namespace)
-        collect_directive_scope(child, name, visited, result,
-                                namespaces_only, types_only);
-    }
-    return result;
+    pa7::FlatIdSet visited;
+    pa7::BindingCandidates result;
+    const std::vector<Id>& directives = visibility_.using_directives(scope);
+    for (std::size_t i = 0; i < directives.size(); ++i)
+        collect_directive_scope(directives[i], name, visited,
+                                result, namespaces_only, types_only);
+    const std::vector<Id>& inlines = visibility_.inline_namespaces(scope);
+    for (std::size_t i = 0; i < inlines.size(); ++i)
+        collect_directive_scope(inlines[i], name, visited,
+                                result, namespaces_only, types_only);
+    return result.release();
   }
 
-  std::vector<Id> lookup_name(const std::string& name,
+  std::vector<Id> lookup_name(Id name,
                               bool namespaces_only = false,
                               bool types_only = false) const
   {
     for (std::vector<Environment>::const_reverse_iterator i = environments_.rbegin();
          i != environments_.rend(); ++i) {
-      const std::unordered_map<std::string, std::vector<Id> >::const_iterator local =
+      const std::unordered_map<Id, std::vector<Id> >::const_iterator local =
           i->names.find(name);
       if (local != i->names.end()) {
         if (namespaces_only) break;
@@ -755,8 +709,8 @@ private:
     }
 
     std::vector<Id> result;
-    std::vector<Id> deferred;
-    std::unordered_set<Id> visited;
+    pa7::BindingCandidates deferred;
+    pa7::FlatIdSet visited;
     for (Id scope = current_scope_; scope != none; scope = unit_.scope(scope).parent) {
       const pa6::ScopeRecord& record = unit_.scope(scope);
       if (record.kind == pa6::NamespaceScope) {
@@ -764,7 +718,7 @@ private:
         if (!result.empty()) return result;
         std::vector<Id> nominated = lookup_namespace_scope(scope, name,
                                                           namespaces_only, types_only);
-        for (std::size_t i = 0; i < nominated.size(); ++i) add_unique(deferred, nominated[i]);
+        for (std::size_t i = 0; i < nominated.size(); ++i) deferred.add(unit_, nominated[i]);
       } else {
         if (namespaces_only) {
           result = direct_bindings(scope, name, true, false);
@@ -774,7 +728,7 @@ private:
           const std::vector<Id> declarations = direct_bindings(scope, name);
           for (std::size_t i = 0; i < declarations.size(); ++i)
             if (unit_.binding(declarations[i]).kind == pa6::EnumeratorBinding)
-              add_unique(deferred, declarations[i]);
+              deferred.add(unit_, declarations[i]);
         }
         for (std::vector<Environment>::const_reverse_iterator i = environments_.rbegin();
              i != environments_.rend(); ++i) {
@@ -782,12 +736,9 @@ private:
             collect_directive_scope(i->using_directives[d], name, visited, deferred,
                                     namespaces_only, types_only);
         }
-        for (std::size_t d = 0; d < record.using_directives.size(); ++d)
-          collect_directive_scope(record.using_directives[d], name, visited, deferred,
-                                  namespaces_only, types_only);
       }
     }
-    return deferred;
+    return deferred.release();
   }
 
   Id namespace_scope(Id binding) const
@@ -802,7 +753,7 @@ private:
     return none;
   }
 
-  std::vector<Id> lookup_qualified(const std::vector<std::string>& parts,
+  std::vector<Id> lookup_qualified(const std::vector<Id>& parts,
                                    bool absolute, bool namespaces_only = false,
                                    bool types_only = false) const
   {
@@ -833,9 +784,10 @@ private:
   std::vector<Id> lookup_node(Id node, bool namespaces_only = false,
                               bool types_only = false) const
   {
-    bool absolute = false;
-    const std::vector<std::string> parts = split_name(node_name(node), absolute);
-    return lookup_qualified(parts, absolute, namespaces_only, types_only);
+    if (node == none || node >= ast_.nodes.size()) return std::vector<Id>();
+    const pa6::SourceNamePath path = unit_.source_name_path(node);
+    return lookup_qualified(path.components, path.absolute,
+                            namespaces_only, types_only);
   }
 
   void push_environment()
@@ -849,9 +801,11 @@ private:
 
   void add_environment_binding(Id binding)
   {
-    if (binding == none || binding >= unit_.binding_count() || environments_.empty()) return;
+    if (binding == none || binding >= unit_.binding_count()) return;
+    visibility_.mark_binding(binding);
+    if (environments_.empty()) return;
     const pa6::Binding& b = unit_.binding(binding);
-    environments_.back().names[b.name].push_back(binding);
+    environments_.back().names[b.name_id].push_back(binding);
   }
 
   bool is_function_binding(Id id) const
@@ -1357,23 +1311,27 @@ private:
     } else if (kind == NIdExpression || kind == NIdentifier) {
       const std::vector<Id> found = lookup_node(node);
       if (found.empty()) throw std::runtime_error("unresolved identifier: " + node_name(node));
-      std::vector<Id> functions;
+      pa7::BindingCandidates function_candidates;
       Id first_non_function = none;
       for (std::size_t i = 0; i < found.size(); ++i) {
-        if (is_function_binding(found[i])) add_unique(functions, found[i]);
+        if (is_function_binding(found[i])) function_candidates.add(unit_, found[i]);
         else if (first_non_function == none) first_non_function = found[i];
       }
+      std::vector<Id> functions = function_candidates.release();
       std::vector<Id> explicit_template_types;
       const bool explicit_template_id = pa7::ExplicitFunctionTemplateTypes(
           unit_, ast_, current_scope_, node, explicit_template_types);
       if (explicit_template_id) {
-        std::vector<Id> instances;
+        pa7::BindingCandidates instance_candidates;
         for (std::size_t i = 0; i < functions.size(); ++i) {
           if (!is_primary_function_template(functions[i])) continue;
           const Id instance = instantiate_template_function(functions[i],
                                                              explicit_template_types);
-          if (instance != none) add_unique(instances, instance);
+          if (instance != none)
+            instance_candidates.add(instance, binding(instance).kind,
+                                    binding(instance).entity);
         }
+        std::vector<Id> instances = instance_candidates.release();
         functions.swap(instances);
         first_non_function = none;
       }
@@ -1448,8 +1406,10 @@ private:
       }
       result.overloads.clear();
     }
-    facts_[node] = result;
-    fact_ready_[node] = true;
+    if (expected == none) {
+      facts_[node] = result;
+      fact_ready_[node] = true;
+    }
     return result;
   }
 
@@ -1841,21 +1801,18 @@ private:
     if (type(class_type).kind != pa6::NamedType)
       throw std::runtime_error("member access requires a class object");
     const Id entity = type(class_type).entity;
-    bool absolute = false;
-    const std::vector<std::string> parts = split_name(node_name(kids[1]), absolute);
-    if (parts.empty()) throw std::runtime_error("member expression has no member name");
-    const std::string member_name = parts.back();
+    const pa6::SourceNamePath member_path = unit_.source_name_path(kids[1]);
+    if (member_path.components.empty())
+      throw std::runtime_error("member expression has no member name");
+    const Id member_name = member_path.components.back();
     Id lookup_entity = entity;
-    if (parts.size() > 1) {
-      std::string qualifier;
-      for (std::size_t i = 0; i + 1 < parts.size(); ++i) {
-        if (!qualifier.empty()) qualifier += "::";
-        qualifier += parts[i];
-      }
-      lookup_entity = named_base_entity(entity, qualifier);
+    if (member_path.components.size() > 1) {
+      std::vector<Id> qualifier(member_path.components.begin(),
+                                member_path.components.end() - 1);
+      lookup_entity = pa7::FindNamedBaseEntity(unit_, entity, qualifier);
       if (lookup_entity == none) throw std::runtime_error("qualified member is not a base class");
     }
-    std::unordered_set<Id> visited;
+    pa7::FlatIdSet visited;
     std::vector<Id> found;
     collect_class_members(lookup_entity, member_name, visited, found);
     if (found.empty()) throw std::runtime_error("unknown class member");
@@ -1876,15 +1833,12 @@ private:
     return result;
   }
 
-  std::vector<Id> argument_nodes(Id list) const
-  { return children(list); }
-
-  Id type_name_binding(const std::string& name) const
+  Id type_name_binding(Id node) const
   {
-    const std::vector<Id> found = lookup_name(name, false, true);
+    const std::vector<Id> found = lookup_node(node, false, true);
     for (std::size_t i = 0; i < found.size(); ++i)
-      if (unit_.binding(found[i]).kind == pa6::AliasBinding ||
-          unit_.binding(found[i]).kind == pa6::TypeBinding)
+      if (binding(found[i]).kind == pa6::AliasBinding ||
+          binding(found[i]).kind == pa6::TypeBinding)
         return found[i];
     return none;
   }
@@ -1929,16 +1883,13 @@ private:
   {
     const std::string name = node_name(callee);
     Id target = none;
-    if (name.compare(0, 9, "decltype(") == 0 && name.size() > 10 && name[name.size() - 1] == ')') {
-      const std::string operand = name.substr(9, name.size() - 10);
-      bool absolute = false;
-      const std::vector<std::string> parts = split_name(operand, absolute);
-      const std::vector<Id> found = lookup_qualified(parts, absolute);
-      if (found.empty()) throw std::runtime_error("unresolved decltype operand: " + operand);
-      target = unit_.binding(found[0]).type;
+    const Id decltype_node = pa7::FindDecltypeSpecifier(ast_, callee);
+    if (decltype_node != none) {
+      const Id operand = ast_.nodes[decltype_node].first_child;
+      target = unit_.decltype_type_node(operand, current_scope_);
     } else if (builtin_type_name(name)) target = builtin_type(name);
     else {
-      const Id binding = type_name_binding(name);
+      const Id binding = type_name_binding(callee);
       if (binding != none) target = unit_.binding(binding).type;
     }
     if (target == none) return ExpressionFact();
@@ -1962,7 +1913,7 @@ private:
       call.argument_types.push_back(target);
     }
     call.function_type = none;
-    calls_[node] = call;
+    call_facts_.store(node, call);
     return result;
   }
 
@@ -1971,7 +1922,7 @@ private:
     if (kids.empty()) throw std::runtime_error("call has no callee");
     const Id callee_node = kids[0];
     const Id arg_list = kids.size() > 1 ? kids[1] : none;
-    std::vector<Id> args = argument_nodes(arg_list);
+    std::vector<Id> args = children(arg_list);
     CallFact call;
     call.callee_node = callee_node;
     call.argument_nodes = args;
@@ -1986,7 +1937,7 @@ private:
       result.constant = true;
       result.value = argument.constant ? 1 : 0;
       call.builtin_constant_p = true;
-      calls_[node] = call;
+      call_facts_.store(node, call);
       return result;
     }
     if (raw_callee == "__builtin_abort") {
@@ -2000,15 +1951,15 @@ private:
       pa6::Type function; function.kind = pa6::FunctionType;
       function.base = result.type;
       call.function_type = unit_.function_type(function);
-      calls_[node] = call;
+      call_facts_.store(node, call);
       return result;
     }
 
     const std::vector<Id> raw_args = args;
     if ((ast_.nodes[callee_node].kind == NIdExpression ||
          ast_.nodes[callee_node].kind == NIdentifier) &&
-        (builtin_type_name(raw_callee) || type_name_binding(raw_callee) != none ||
-         raw_callee.compare(0, 9, "decltype(") == 0)) {
+        (builtin_type_name(raw_callee) || type_name_binding(callee_node) != none ||
+        pa7::FindDecltypeSpecifier(ast_, callee_node) != none)) {
       ExpressionFact cast = analyze_functional_cast(node, callee_node, args, call);
       if (cast.type != none) return cast;
     }
@@ -2043,7 +1994,7 @@ private:
       call.function_type = function;
     }
     call.callee_node = callee_node;
-    calls_[node] = call;
+    call_facts_.store(node, call);
 
     const pa6::Type& signature = type(call.function_type);
     ExpressionFact result;
@@ -2154,9 +2105,9 @@ private:
       return;
     }
     if (kind == NCallExpression) {
-      std::unordered_map<Id, CallFact>::const_iterator call_it = calls_.find(node);
-      if (call_it == calls_.end()) throw std::logic_error("call facts were not recorded");
-      const CallFact& call = call_it->second;
+      const CallFact* call_record = call_facts_.find(node);
+      if (!call_record) throw std::logic_error("call facts were not recorded");
+      const CallFact& call = *call_record;
       if (call.special_name == "<functional-cast-zero>") {
         header << "literal prvalue " << type_spelling(fact.type) << " 0";
         line(depth, header.str());
@@ -2268,8 +2219,14 @@ private:
         else header << ' ' << token_label(node);
       }
       line(depth, header.str());
-      for (std::size_t i = 0; i < kids.size(); ++i)
-        if (ast_.nodes[kids[i]].kind != NTypeId) emit_expression(kids[i], depth + 1);
+      for (std::size_t i = 0; i < kids.size(); ++i) {
+        if (ast_.nodes[kids[i]].kind == NTypeId) continue;
+        if (i > 0 && type(target_value).kind == pa6::PointerType &&
+            is_function(type(target_value).base) &&
+            ast_.nodes[kids[i]].kind == NUnaryExpression && text(kids[i]) == "&")
+          emit_expression(kids[i], depth + 1, target);
+        else emit_expression(kids[i], depth + 1);
+      }
       return;
     }
     if (kind == NMemberExpression) {
@@ -2277,7 +2234,8 @@ private:
       if (kids.size() > 1 && ast_.nodes[node].atom != none) {
         const ast_tokens::Token& op = ast_.tokens[ast_.nodes[node].atom];
         bool absolute = false;
-        const std::vector<std::string> member_parts = split_name(node_name(kids.back()), absolute);
+        const std::vector<std::string> member_parts =
+            pa7::SplitNameSpelling(node_name(kids.back()), absolute);
         const std::string member_name = member_parts.empty()
             ? node_name(kids.back()) : member_parts.back();
         member_operator = op.tag + ":" + member_name;
@@ -2292,29 +2250,6 @@ private:
       return;
     }
     throw std::runtime_error("cannot print semantic expression");
-  }
-
-  std::string declarator_name(Id node) const
-  {
-    if (node == none) return std::string();
-    if (ast_.nodes[node].kind == NIdentifier || ast_.nodes[node].kind == NIdExpression)
-      return node_name(node);
-    for (Id c = ast_.nodes[node].first_child; c != none; c = ast_.nodes[c].next_sibling) {
-      const std::string found = declarator_name(c);
-      if (!found.empty()) return found;
-    }
-    return std::string();
-  }
-
-  Id first_parameter_clause(Id node) const
-  {
-    if (node == none) return none;
-    if (ast_.nodes[node].kind == NParameterClause) return node;
-    for (Id c = ast_.nodes[node].first_child; c != none; c = ast_.nodes[c].next_sibling) {
-      const Id result = first_parameter_clause(c);
-      if (result != none) return result;
-    }
-    return none;
   }
 
   Id initializer_expression(Id node) const
@@ -2373,11 +2308,11 @@ private:
     emit_expression(expr, depth, target, preserve_expected_cv);
   }
 
-  void register_ordinary_name(Id scope, const std::string& name,
+  void register_ordinary_name(Id scope, Id name,
                               pa6::BindingKind kind)
   {
-    std::unordered_map<std::string, pa6::BindingKind>& names = namespace_ordinary_kinds_[scope];
-    std::unordered_map<std::string, pa6::BindingKind>::const_iterator found = names.find(name);
+    std::unordered_map<Id, pa6::BindingKind>& names = namespace_ordinary_kinds_[scope];
+    std::unordered_map<Id, pa6::BindingKind>::const_iterator found = names.find(name);
     if (found != names.end() && found->second != kind &&
         (found->second == pa6::FunctionBinding || found->second == pa6::VariableBinding) &&
         (kind == pa6::FunctionBinding || kind == pa6::VariableBinding))
@@ -2389,6 +2324,7 @@ private:
   {
     Id seq = ast_.nodes[node].first_child;
     Id list = seq == none ? none : ast_.nodes[seq].next_sibling;
+    visibility_.mark_type_declarations(unit_, ast_, seq);
     Id anonymous_union_spec = none;
     for (Id spec = seq == none ? none : ast_.nodes[seq].first_child;
          spec != none; spec = ast_.nodes[spec].next_sibling) {
@@ -2407,12 +2343,13 @@ private:
     for (Id item = ast_.nodes[list].first_child; item != none; item = ast_.nodes[item].next_sibling) {
       const Id binding = unit_.binding_for_node(item);
       if (binding == none) continue;
+      visibility_.mark_binding(binding);
       const pa6::Binding& b = unit_.binding(binding);
       const std::string name = b.kind == pa6::FunctionBinding ||
           (b.kind == pa6::VariableBinding && unit_.scope(b.scope).kind == pa6::ClassScope)
           ? qualified_name(b.scope, b.name) : b.name;
       if (b.kind == pa6::FunctionBinding || b.kind == pa6::VariableBinding)
-        register_ordinary_name(b.scope, b.name, b.kind);
+        register_ordinary_name(b.scope, b.name_id, b.kind);
       std::ostringstream out;
       if (b.kind == pa6::FunctionBinding)
       out << "function-declaration " << name << ' '
@@ -2439,12 +2376,30 @@ private:
     }
   }
 
+  void expose_template_declaration(Id node)
+  {
+    Id declaration = ast_.nodes[node].first_child;
+    declaration = declaration == none ? none : ast_.nodes[declaration].next_sibling;
+    if (declaration == none) return;
+    if (ast_.nodes[declaration].kind == NFunctionDefinition) {
+      visibility_.mark_binding(unit_.binding_for_node(declaration));
+      return;
+    }
+    if (ast_.nodes[declaration].kind != NSimpleDeclaration) return;
+    const Id sequence = ast_.nodes[declaration].first_child;
+    const Id list = sequence == none ? none : ast_.nodes[sequence].next_sibling;
+    for (Id item = list == none ? none : ast_.nodes[list].first_child;
+         item != none; item = ast_.nodes[item].next_sibling)
+      visibility_.mark_binding(unit_.binding_for_node(item));
+  }
+
   void emit_declaration(Id node, unsigned depth)
   {
     const NodeKind kind = ast_.nodes[node].kind;
     if (kind == NNamespaceDefinition) {
       const Id prior_scope = current_scope_;
       const Id ns = unit_.scope_for_node(node);
+      visibility_.expose_namespace_definition(unit_, ns);
       current_scope_ = ns == none ? prior_scope : ns;
       std::string name = text(node);
       if (name.empty()) name = "<unnamed>";
@@ -2455,10 +2410,30 @@ private:
     } else if (kind == NSimpleDeclaration) emit_top_simple(node, depth);
     else if (kind == NAliasDeclaration) {
       const Id binding = unit_.binding_for_node(node);
-      if (binding != none)
+      if (binding != none) {
+        visibility_.mark_binding(binding);
         line(depth, "type-alias " + unit_.binding(binding).name + " " +
              type_spelling(unit_.binding(binding).type));
+      }
     } else if (kind == NFunctionDefinition) emit_function(node, depth);
+    else if (kind == NTemplateDeclaration) expose_template_declaration(node);
+    else if (kind == NClassForwardDeclaration)
+      visibility_.mark_binding(unit_.binding_for_node(node));
+    else if (kind == NClassSpecifier || kind == NEnumSpecifier)
+      visibility_.mark_type_declarations(unit_, ast_, node);
+    else if (kind == NNamespaceAliasDefinition)
+      visibility_.mark_binding(unit_.binding_for_node(node));
+    else if (kind == NUsingDeclaration)
+      visibility_.mark_binding(unit_.binding_for_node(node));
+    else if (kind == NUsingDirective) {
+      const Id target = ast_.nodes[node].first_child;
+      const std::vector<Id> found = lookup_node(target, true, false);
+      if (found.empty()) throw std::runtime_error("using directive target not found");
+      const Id nominated = namespace_scope(found[0]);
+      if (nominated == none)
+        throw std::runtime_error("using directive target is not a namespace");
+      visibility_.add_using_directive(current_scope_, nominated);
+    }
     else if (kind == NLinkageSpecification) {
       for (Id c = ast_.nodes[node].first_child; c != none; c = ast_.nodes[c].next_sibling)
         emit_declaration(c, depth);
@@ -2492,28 +2467,39 @@ private:
     line(depth + 1, "compound-statement");
   }
 
-  Id template_function_declarator(Id primary) const
+  void index_function_definitions_and_templates()
   {
     for (Id node = 0; node < ast_.nodes.size(); ++node) {
-      if (ast_.nodes[node].kind != NTemplateDeclaration) continue;
+      const NodeKind kind = ast_.nodes[node].kind;
+      if (kind == NFunctionDefinition) {
+        const Id binding = unit_.binding_for_node(node);
+        if (binding != none && binding < unit_.binding_count() &&
+            unit_.scope(unit_.binding(binding).scope).kind == pa6::ClassScope)
+          member_definition_nodes_[binding] = node;
+        continue;
+      }
+      if (kind != NTemplateDeclaration) continue;
       const Id declaration = ast_.nodes[node].first_child == none ? none
           : ast_.nodes[ast_.nodes[node].first_child].next_sibling;
       if (declaration == none) continue;
       if (ast_.nodes[declaration].kind == NFunctionDefinition) {
-        if (unit_.binding_for_node(declaration) == primary) {
-          const Id seq = ast_.nodes[declaration].first_child;
-          return seq == none ? none : ast_.nodes[seq].next_sibling;
-        }
+        const Id binding = unit_.binding_for_node(declaration);
+        const Id seq = ast_.nodes[declaration].first_child;
+        const Id declarator = seq == none ? none : ast_.nodes[seq].next_sibling;
+        if (binding != none && declarator != none)
+          template_declarators_[binding] = declarator;
       } else if (ast_.nodes[declaration].kind == NSimpleDeclaration) {
         const Id seq = ast_.nodes[declaration].first_child;
         const Id list = seq == none ? none : ast_.nodes[seq].next_sibling;
         for (Id item = list == none ? none : ast_.nodes[list].first_child;
-             item != none; item = ast_.nodes[item].next_sibling)
-          if (unit_.binding_for_node(item) == primary)
-            return ast_.nodes[item].first_child;
+             item != none; item = ast_.nodes[item].next_sibling) {
+          const Id binding = unit_.binding_for_node(item);
+          const Id declarator = ast_.nodes[item].first_child;
+          if (binding != none && declarator != none)
+            template_declarators_[binding] = declarator;
+        }
       }
     }
-    return none;
   }
 
   void emit_function_instance(Id id, unsigned depth)
@@ -2527,16 +2513,19 @@ private:
          type_spelling(signature_id));
     std::vector<std::string> parameter_names;
     const std::size_t instance_index = id - unit_.binding_count();
-    const Id declarator = template_function_declarator(
-        instantiated_function_origins_[instance_index]);
-    const Id clause = first_parameter_clause(declarator);
+    const std::unordered_map<Id, Id>::const_iterator found =
+        template_declarators_.find(instantiated_function_origins_[instance_index]);
+    if (found == template_declarators_.end())
+      throw std::logic_error("function template declarator index is incomplete");
+    const Id declarator = found->second;
+    const Id clause = pa7::FindFirstParameterClause(ast_, declarator);
     for (Id parameter = clause == none ? none : ast_.nodes[clause].first_child;
          parameter != none; parameter = ast_.nodes[parameter].next_sibling) {
       if (ast_.nodes[parameter].kind != NParameterDeclaration) continue;
       const Id sequence = ast_.nodes[parameter].first_child;
       const Id parameter_declarator = sequence == none ? none
           : ast_.nodes[sequence].next_sibling;
-      parameter_names.push_back(declarator_name(parameter_declarator));
+      parameter_names.push_back(pa7::FindDeclaratorName(ast_, parameter_declarator));
     }
     for (std::size_t i = 0; i < signature.parameters.size(); ++i) {
       const std::string name = i < parameter_names.size() ? parameter_names[i] : "";
@@ -2551,7 +2540,7 @@ private:
         unit_.binding(binding).kind != pa6::FunctionBinding ||
         unit_.scope(unit_.binding(binding).scope).kind != pa6::ClassScope)
       return;
-    if (demanded_member_set_.insert(binding).second)
+    if (demanded_member_set_.insert(binding))
       demanded_member_definitions_.push_back(binding);
   }
 
@@ -2559,10 +2548,11 @@ private:
   {
     const Id binding = unit_.binding_for_node(node);
     if (binding == none) throw std::runtime_error("function definition has no declaration binding");
+    visibility_.mark_binding(binding);
     const pa6::Binding& function = unit_.binding(binding);
-    if (function.entity != none && !defined_functions_.insert(function.entity).second)
+    if (function.entity != none && !defined_functions_.insert(function.entity))
       throw std::runtime_error("duplicate function definition");
-    register_ordinary_name(function.scope, function.name, pa6::FunctionBinding);
+    register_ordinary_name(function.scope, function.name_id, pa6::FunctionBinding);
     const Id signature_id = canonical_function(function.type);
     if (!is_function(signature_id)) throw std::runtime_error("function definition has non-function type");
     Id declarator = ast_.nodes[node].first_child;
@@ -2570,7 +2560,7 @@ private:
     const std::string name = qualified_name(function.scope, function.name);
     const Id dump_signature = function_dump_type(binding);
     line(depth, "function-definition " + name + " " + type_spelling(dump_signature));
-    const Id clause = first_parameter_clause(declarator);
+    const Id clause = pa7::FindFirstParameterClause(ast_, declarator);
     const Id old_scope = current_scope_;
     const Id old_function_type = current_function_type_;
     generated_union_constructors_.clear();
@@ -2625,6 +2615,7 @@ private:
     }
     const Id seq = ast_.nodes[node].first_child;
     const Id list = seq == none ? none : ast_.nodes[seq].next_sibling;
+    visibility_.mark_type_declarations(unit_, ast_, seq);
     Id anonymous_union_spec = none;
     for (Id spec = seq == none ? none : ast_.nodes[seq].first_child;
          spec != none; spec = ast_.nodes[spec].next_sibling) {
@@ -2961,8 +2952,18 @@ private:
       if (binding != none) add_environment_binding(binding);
       return;
     }
-    if (kind == NNamespaceAliasDefinition) return;
+    if (kind == NNamespaceAliasDefinition) {
+      const Id binding = unit_.binding_for_node(node);
+      if (binding != none) add_environment_binding(binding);
+      return;
+    }
+    if (kind == NEnumSpecifier) {
+      visibility_.mark_type_declarations(unit_, ast_, node);
+      line(depth, "simple-declaration");
+      return;
+    }
     if (kind == NClassSpecifier && ast_.nodes[node].composite == none) {
+      visibility_.mark_type_declarations(unit_, ast_, node);
       Id union_key = none;
       for (Id c = ast_.nodes[node].first_child; c != none; c = ast_.nodes[c].next_sibling)
         if (ast_.nodes[c].kind == NClassKey && text(c) == "union") union_key = c;

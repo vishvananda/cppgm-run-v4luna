@@ -1,0 +1,47 @@
+1 translation units
+start translation unit 1
+translation-unit
+  function-declaration choose function of (long int) returning int
+  function-definition run function of () returning int
+    compound-statement
+      return-statement
+        call-expression prvalue int
+          callee choose function of (long int) returning int
+          literal prvalue int 1
+  function-declaration choose function of (int) returning int
+  variable outer long int
+    literal prvalue int 7
+  function-definition local_scope function of () returning int
+    compound-statement
+      simple-declaration
+        variable result long int
+          id-expression lvalue long int outer
+      simple-declaration
+        variable outer int
+          literal prvalue int 11
+      return-statement
+        id-expression lvalue long int result
+  namespace-definition Selected
+    function-declaration Selected::imported function of (int) returning int
+  namespace-definition ScopeOrder
+    function-definition ScopeOrder::after_using function of () returning int
+      compound-statement
+        return-statement
+          call-expression prvalue int
+            callee Selected::imported function of (int) returning int
+            literal prvalue int 1
+  type-alias LocalType long int
+  function-definition local_type_before_hiding function of () returning int
+    compound-statement
+      simple-declaration
+        variable before long int
+          cast-expression prvalue long int
+            literal prvalue int 1
+      simple-declaration
+        variable LocalType int
+          literal prvalue int 2
+      return-statement
+        binary-expression prvalue long int OP_PLUS:+
+          id-expression lvalue long int before
+          id-expression lvalue int LocalType
+end translation unit

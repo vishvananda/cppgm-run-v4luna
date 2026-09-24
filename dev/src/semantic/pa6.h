@@ -59,6 +59,7 @@ struct ScopeRecord
   std::vector<Id> bindings;
   std::vector<Id> output_order;
   std::vector<Id> children;
+  std::vector<Id> inline_namespace_children;
   std::vector<Id> using_directives;
   ScopeRecord(ScopeKind k = BlockScope, const std::string& n = std::string(),
               Id p = InvalidId, Id e = InvalidId)
@@ -69,6 +70,7 @@ struct Entity
 {
   EntityKind kind;
   std::string name;
+  Id name_id;
   Id scope;
   Id type;
   bool complete;
@@ -79,9 +81,16 @@ struct Entity
   std::string class_key;
   Id underlying;
   std::vector<Id> bases;
-  Entity() : kind(ClassEntity), scope(InvalidId), type(InvalidId), complete(false),
+  Entity() : kind(ClassEntity), name_id(InvalidId), scope(InvalidId), type(InvalidId), complete(false),
       defined(false), scoped_enum(false), is_union(false), is_anonymous(false),
       underlying(InvalidId) {}
+};
+
+struct SourceNamePath
+{
+  std::vector<Id> components;
+  bool absolute;
+  SourceNamePath() : absolute(false) {}
 };
 
 struct Binding
@@ -131,9 +140,14 @@ public:
   Id binding_for_node(Id ast_node) const;
   Id scope_for_node(Id ast_node) const;
   Id type_for_node(Id ast_node) const;
+  SourceNamePath source_name_path(Id ast_node);
+  std::vector<Id> lookup_bindings(Id scope, Id name_id,
+                                  bool types_only = false,
+                                  bool namespaces_only = false) const;
   std::string anonymous_union_storage_name(Id declaration) const;
   Id add_condition_binding(Id ast_node, Id parent_scope);
   Id resolve_type_node(Id ast_node, Id scope);
+  Id decltype_type_node(Id expression_node, Id scope);
   Id fundamental_type(const std::string& name);
   Id qualified_type(Id type, bool is_const, bool is_volatile);
   Id pointer_type(Id type);

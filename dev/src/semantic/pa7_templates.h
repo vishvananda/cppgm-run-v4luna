@@ -26,12 +26,16 @@ void IndexNamespaceFunctionTemplates(const pa6::SemanticUnit& unit,
 // Instantiate a type-only function template from explicit type arguments or
 // function-call argument types. Returns InvalidId when deduction is not
 // supported or does not produce a complete specialization.
-pa6::Id InstantiateFunctionTemplateType(
+bool ResolveFunctionTemplateArguments(
     pa6::SemanticUnit& unit, pa6::Id primary,
     const std::vector<pa6::Id>& explicit_types,
     const std::vector<pa6::Id>& argument_types,
     bool deduce_from_arguments,
     std::vector<pa6::Id>& specialization_arguments);
+
+pa6::Id InstantiateFunctionTemplateType(
+    pa6::SemanticUnit& unit, pa6::Id primary,
+    const std::vector<pa6::Id>& specialization_arguments);
 
 bool ExplicitFunctionTemplateTypes(
     pa6::SemanticUnit& unit, const Ast& ast, pa6::Id scope, pa6::Id node,

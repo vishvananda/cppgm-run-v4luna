@@ -133,6 +133,28 @@ bool has_parameter(const pa6::SemanticUnit& unit, Id id,
   return false;
 }
 
+bool function_template_shape(const pa6::SemanticUnit& unit, Id primary,
+                             std::vector<Id>& parameters, Id& pattern)
+{
+  if (primary >= unit.binding_count() ||
+      unit.binding(primary).kind != pa6::FunctionBinding) return false;
+  const Id scope = unit.binding(primary).scope;
+  if (scope >= unit.scope_count() || unit.scope(scope).kind != pa6::TemplateScope)
+    return false;
+  const pa6::ScopeRecord& template_scope = unit.scope(scope);
+  for (std::size_t i = 0; i < template_scope.bindings.size(); ++i) {
+    const pa6::Binding& candidate = unit.binding(template_scope.bindings[i]);
+    if (candidate.kind == pa6::TypeBinding && candidate.type < unit.type_count() &&
+        unit.type(candidate.type).kind == pa6::TemplateParameterType)
+      parameters.push_back(candidate.type);
+    else if (candidate.kind == pa6::VariableBinding)
+      return false;
+  }
+  pattern = unit.binding(primary).type;
+  return !parameters.empty() && pattern < unit.type_count() &&
+      unit.type(pattern).kind == pa6::FunctionType;
+}
+
 }  // namespace
 
 void IndexNamespaceFunctionTemplates(const pa6::SemanticUnit& unit,
@@ -163,38 +185,23 @@ std::size_t TypeArgumentVectorHash::operator()(
   return result;
 }
 
-Id InstantiateFunctionTemplateType(pa6::SemanticUnit& unit, Id primary,
-                                   const std::vector<Id>& explicit_types,
-                                   const std::vector<Id>& argument_types,
-                                   bool deduce_from_arguments,
-                                   std::vector<Id>& specialization_arguments)
+bool ResolveFunctionTemplateArguments(
+    pa6::SemanticUnit& unit, Id primary,
+    const std::vector<Id>& explicit_types,
+    const std::vector<Id>& argument_types,
+    bool deduce_from_arguments,
+    std::vector<Id>& specialization_arguments)
 {
   specialization_arguments.clear();
-  if (primary >= unit.binding_count() ||
-      unit.binding(primary).kind != pa6::FunctionBinding) return none;
-  const pa6::Binding& declaration = unit.binding(primary);
-  const Id template_scope_id = declaration.scope;
-  if (template_scope_id >= unit.scope_count() ||
-      unit.scope(template_scope_id).kind != pa6::TemplateScope) return none;
-  const pa6::ScopeRecord& template_scope = unit.scope(template_scope_id);
   std::vector<Id> parameters;
-  for (std::size_t i = 0; i < template_scope.bindings.size(); ++i) {
-    const pa6::Binding& candidate = unit.binding(template_scope.bindings[i]);
-    if (candidate.kind == pa6::TypeBinding && candidate.type < unit.type_count() &&
-        unit.type(candidate.type).kind == pa6::TemplateParameterType)
-      parameters.push_back(candidate.type);
-    else if (candidate.kind == pa6::VariableBinding)
-      return none;
-  }
+  Id pattern_id = none;
+  if (!function_template_shape(unit, primary, parameters, pattern_id)) return false;
   if (parameters.empty() || explicit_types.size() > parameters.size() ||
-      (!deduce_from_arguments && explicit_types.size() != parameters.size())) return none;
-  const Id pattern_id = declaration.type;
-  if (pattern_id >= unit.type_count() || unit.type(pattern_id).kind != pa6::FunctionType)
-    return none;
+      (!deduce_from_arguments && explicit_types.size() != parameters.size())) return false;
   const pa6::Type pattern = unit.type(pattern_id);
   if (deduce_from_arguments &&
       ((!pattern.variadic && argument_types.size() != pattern.parameters.size()) ||
-       (pattern.variadic && argument_types.size() < pattern.parameters.size()))) return none;
+       (pattern.variadic && argument_types.size() < pattern.parameters.size()))) return false;
 
   std::unordered_set<Id> parameter_declarations;
   std::unordered_map<Id, Id> substitutions;
@@ -210,14 +217,30 @@ Id InstantiateFunctionTemplateType(pa6::SemanticUnit& unit, Id primary,
       const bool by_value = kind != pa6::LvalueReferenceType &&
           kind != pa6::RvalueReferenceType;
       if (!deduce(unit, formal, argument_types[i], parameter_declarations,
-                  substitutions, by_value)) return none;
+                  substitutions, by_value)) return false;
     }
   }
-  if (substitutions.size() != parameters.size()) return none;
+  if (substitutions.size() != parameters.size()) return false;
   for (std::size_t i = 0; i < parameters.size(); ++i)
     specialization_arguments.push_back(
         substitutions[unit.type(parameters[i]).declaration]);
-  const Id result = substitute(unit, pattern_id, substitutions);
+  return true;
+}
+
+Id InstantiateFunctionTemplateType(
+    pa6::SemanticUnit& unit, Id primary,
+    const std::vector<Id>& specialization_arguments)
+{
+  std::vector<Id> parameters;
+  Id pattern = none;
+  if (!function_template_shape(unit, primary, parameters, pattern) ||
+      parameters.size() != specialization_arguments.size()) return none;
+  std::unordered_map<Id, Id> substitutions;
+  for (std::size_t i = 0; i < parameters.size(); ++i) {
+    if (specialization_arguments[i] >= unit.type_count()) return none;
+    substitutions[unit.type(parameters[i]).declaration] = specialization_arguments[i];
+  }
+  const Id result = substitute(unit, pattern, substitutions);
   std::unordered_set<Id> visited;
   if (result == none || has_parameter(unit, result, visited)) return none;
   return result;

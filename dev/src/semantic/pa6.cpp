@@ -318,9 +318,38 @@ public:
   Id lookup_name(Id scope, const std::string& name, bool types_only,
                  bool namespaces_only) const
   { return resolve_name_binding(scope, name, types_only, namespaces_only); }
+  SourceNamePath source_name_path(Id node)
+  {
+    const NamePath source = name_path(node);
+    SourceNamePath result;
+    result.absolute = source.absolute;
+    for (std::size_t i = 0; i < source.components.size(); ++i)
+      result.components.push_back(source.components[i].identity);
+    return result;
+  }
+  std::vector<Id> lookup_bindings(Id scope, Id name, bool types_only,
+                                  bool namespaces_only) const
+  {
+    std::vector<Id> result;
+    if (scope == none || scope >= scopes_.size() || name == none) return result;
+    const Id first = scopes_[scope].index.find(name);
+    if (types_only && first != none && !is_type_binding(bindings_[first].kind))
+      return result;
+    for (Id binding = first; binding != none;
+         binding = bindings_[binding].previous_same_name) {
+      const BindingKind kind = bindings_[binding].kind;
+      if (namespaces_only ? kind == NamespaceBinding
+          : types_only ? is_type_binding(kind) : kind != NamespaceBinding)
+        result.push_back(binding);
+    }
+    std::reverse(result.begin(), result.end());
+    return result;
+  }
   Id binding_for_node(Id node) const
   {
     const Id* binding = ast_bindings_.find(node);
+    if (!binding) binding = class_tag_bindings_.find(node);
+    if (!binding) binding = enum_tag_bindings_.find(node);
     return binding ? *binding : none;
   }
   Id scope_for_node(Id node) const
@@ -363,6 +392,8 @@ public:
     return binding;
   }
   Id resolve_type_node(Id node, Id scope) { return type_id(node, scope); }
+  Id decltype_type_node(Id expression, Id scope)
+  { return decltype_type(expression, scope); }
   Id make_fundamental(const std::string& name) { return fundamental(name); }
   Id make_qualified(Id type, bool is_const, bool is_volatile)
   { return qualified(type, is_const, is_volatile); }
@@ -616,6 +647,8 @@ private:
 
   Id new_entity(Entity entity)
   {
+    if (entity.name_id == none && !entity.name.empty())
+      entity.name_id = name_id(entity.name);
     const Id id = entities_.size(); entities_.push_back(entity); return id;
   }
 
@@ -703,13 +736,9 @@ private:
     const Scope& s = scopes_[scope];
     for (std::size_t i = 0; i < s.using_directives.size(); ++i)
       lookup_directives(s.using_directives[i], name, types_only, namespaces_only, visited, result);
-    if (s.kind == NamespaceScope) {
-      for (std::size_t i = 0; i < s.children.size(); ++i) {
-        const Id child = s.children[i];
-        if (scopes_[child].inline_namespace)
-          lookup_directives(child, name, types_only, namespaces_only, visited, result);
-      }
-    }
+    for (std::size_t i = 0; i < s.inline_namespace_children.size(); ++i)
+      lookup_directives(s.inline_namespace_children[i], name, types_only,
+                        namespaces_only, visited, result);
   }
 
   Id lookup(Id scope, Id name, bool types_only = false,
@@ -727,11 +756,9 @@ private:
                           namespaces_only, visited,
                           scopes_[s].kind == BlockScope || scopes_[s].kind == FunctionScope
                               ? block_directives : found);
-      for (std::size_t i = 0; i < scopes_[s].children.size(); ++i) {
-        const Id child = scopes_[s].children[i];
-        if (scopes_[child].inline_namespace)
-          lookup_directives(child, name, types_only, namespaces_only, visited, found);
-      }
+      for (std::size_t i = 0; i < scopes_[s].inline_namespace_children.size(); ++i)
+        lookup_directives(scopes_[s].inline_namespace_children[i], name, types_only,
+                          namespaces_only, visited, found);
       if (scopes_[s].kind == NamespaceScope) {
         for (std::size_t i = 0; i < block_directives.size(); ++i)
           if (std::find(found.begin(), found.end(), block_directives[i]) == found.end())
@@ -788,9 +815,9 @@ private:
     const Scope& s = scopes_[scope];
     for (std::size_t i = 0; i < s.using_directives.size(); ++i)
       lookup_directives(s.using_directives[i], name, types_only, namespaces_only, visited, found);
-    for (std::size_t i = 0; i < s.children.size(); ++i)
-      if (scopes_[s.children[i]].inline_namespace)
-        lookup_directives(s.children[i], name, types_only, namespaces_only, visited, found);
+    for (std::size_t i = 0; i < s.inline_namespace_children.size(); ++i)
+      lookup_directives(s.inline_namespace_children[i], name, types_only,
+                        namespaces_only, visited, found);
     if (found.size() == 1) return found[0];
     if (found.size() > 1) throw std::runtime_error("ambiguous qualified name");
     return none;
@@ -1544,6 +1571,7 @@ private:
       const Id value_id = new_entity(value_entity);
       const Id b = add_binding(binding_scope, EnumeratorBinding, text(item), e.type,
                                 value_id, output);
+      ast_bindings_.set(item, b);
       bindings_[b].has_value = true;
       bindings_[b].value = next;
       if (next == LLONG_MAX) throw std::runtime_error("enumerator value overflow");
@@ -2080,7 +2108,10 @@ private:
         add_or_find_binding(parent, NamespaceBinding, name, none, eid, false);
       }
     }
-    scopes_[ns_scope].inline_namespace = scopes_[ns_scope].inline_namespace || is_inline;
+    if (is_inline && !scopes_[ns_scope].inline_namespace) {
+      scopes_[ns_scope].inline_namespace = true;
+      scopes_[parent].inline_namespace_children.push_back(ns_scope);
+    }
     ast_scopes_.set(node, ns_scope);
     for (std::size_t i = 0; i < body.size(); ++i)
       if (ast_.nodes[body[i]].kind != NInlineMarker) process(body[i], ns_scope);
@@ -2675,12 +2706,20 @@ Id SemanticUnit::scope_for_node(Id node) const
 { return impl_->analyzer->scope_for_node(node); }
 Id SemanticUnit::type_for_node(Id node) const
 { return impl_->analyzer->type_for_node(node); }
+SourceNamePath SemanticUnit::source_name_path(Id node)
+{ return impl_->analyzer->source_name_path(node); }
+std::vector<Id> SemanticUnit::lookup_bindings(Id scope, Id name_id,
+                                               bool types_only,
+                                               bool namespaces_only) const
+{ return impl_->analyzer->lookup_bindings(scope, name_id, types_only, namespaces_only); }
 std::string SemanticUnit::anonymous_union_storage_name(Id node) const
 { return impl_->analyzer->anonymous_union_storage_name(node); }
 Id SemanticUnit::add_condition_binding(Id node, Id parent_scope)
 { return impl_->analyzer->add_condition_binding(node, parent_scope); }
 Id SemanticUnit::resolve_type_node(Id node, Id scope)
 { return impl_->analyzer->resolve_type_node(node, scope); }
+Id SemanticUnit::decltype_type_node(Id expression_node, Id scope)
+{ return impl_->analyzer->decltype_type_node(expression_node, scope); }
 Id SemanticUnit::fundamental_type(const std::string& name)
 { return impl_->analyzer->make_fundamental(name); }
 Id SemanticUnit::qualified_type(Id type, bool is_const, bool is_volatile)

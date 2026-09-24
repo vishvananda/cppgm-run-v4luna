@@ -986,13 +986,10 @@ private:
     if (is_keyword("class") || is_keyword("struct") || is_keyword("union")) {
       std::size_t key = take();
       skip_attribute_specifier();
-      std::string name;
-      if (is_identifier()) name = tokens_[take()].text;
+      ParsedName name;
+      if (is_identifier() || is("::")) name = joined_name();
       std::size_t elaborated = node(NClassForwardDeclaration, key);
-      if (!name.empty()) {
-        ast_.composite_atoms.push_back(name);
-        ast_.nodes[elaborated].composite = ast_.composite_atoms.size() - 1;
-      }
+      if (!name.spelling.empty()) set_composite_name(elaborated, name);
       ast_.append(elaborated, atom_node(NClassKey, key));
       ast_.append(seq, elaborated);
       any = true;
@@ -1786,10 +1783,7 @@ private:
       name = parsed_name.spelling;
     }
     std::size_t n = node(NEnumSpecifier);
-    if (!name.empty()) {
-      ast_.composite_atoms.push_back(name);
-      ast_.nodes[n].composite = ast_.composite_atoms.size() - 1;
-    }
+    if (!name.empty()) set_composite_name(n, parsed_name);
     if (key != none) ast_.append(n, atom_node(NEnumKey, key));
     if (!name.empty() && name.find("::") == std::string::npos) bind_name(name, TypeNameKind);
     if (consume(":")) ast_.append(n, parse_type_id());

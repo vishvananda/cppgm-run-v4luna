@@ -4,55 +4,42 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <climits>
 #include <cstdlib>
+#include <functional>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
-#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
 namespace cppgm {
 namespace {
 
-typedef std::size_t Id;
-const Id none = static_cast<Id>(-1);
-
-enum TypeKind {
-  InvalidType, FundamentalType, NamedType, TemplateParameterType,
-  QualifiedType, PointerType, LvalueReferenceType, RvalueReferenceType,
-  ArrayType, FunctionType
-};
-
-struct Type
-{
-  TypeKind kind;
-  std::string atom;
-  Id base;
-  Id entity;
-  long long bound;
-  bool variadic;
-  std::vector<Id> parameters;
-  Type() : kind(InvalidType), base(none), entity(none), bound(0), variadic(false) {}
-};
+using namespace pa6;
+typedef pa6::Id Id;
+const Id none = pa6::InvalidId;
 
 struct TypeKey
 {
   TypeKind kind;
-  std::string atom;
+  const std::string* atom;
   Id base;
   Id entity;
+  Id declaration;
   long long bound;
   bool variadic;
-  std::vector<Id> parameters;
-  bool operator==(const TypeKey& r) const
-  {
-    return kind == r.kind && atom == r.atom && base == r.base && entity == r.entity &&
-        bound == r.bound && variadic == r.variadic && parameters == r.parameters;
-  }
+  bool member_const;
+  bool member_volatile;
+  RefQualifier ref_qualifier;
+  const std::vector<Id>* parameters;
+  TypeKey() : kind(InvalidType), atom(0), base(none), entity(none),
+      declaration(none),
+      bound(0), variadic(false), member_const(false), member_volatile(false),
+      ref_qualifier(NoRefQualifier), parameters(0) {}
 };
 
 struct TypeKeyHash
@@ -61,77 +48,202 @@ struct TypeKeyHash
   {
     std::size_t h = static_cast<std::size_t>(k.kind) + 0x9e3779b9U;
     const std::size_t prime = static_cast<std::size_t>(1099511628211ULL);
-    h = (h ^ std::hash<std::string>()(k.atom)) * prime;
+    h = (h ^ std::hash<std::string>()(*k.atom)) * prime;
     h = (h ^ std::hash<Id>()(k.base)) * prime;
     h = (h ^ std::hash<Id>()(k.entity)) * prime;
+    h = (h ^ std::hash<Id>()(k.declaration)) * prime;
     h = (h ^ std::hash<long long>()(k.bound)) * prime;
     h = (h ^ std::hash<bool>()(k.variadic)) * prime;
-    for (std::size_t i = 0; i < k.parameters.size(); ++i)
-      h = (h ^ std::hash<Id>()(k.parameters[i])) * prime;
+    h = (h ^ std::hash<bool>()(k.member_const)) * prime;
+    h = (h ^ std::hash<bool>()(k.member_volatile)) * prime;
+    h = (h ^ std::hash<int>()(static_cast<int>(k.ref_qualifier))) * prime;
+    for (std::size_t i = 0; i < k.parameters->size(); ++i)
+      h = (h ^ std::hash<Id>()((*k.parameters)[i])) * prime;
     return h;
   }
 };
 
-enum ScopeKind { NamespaceScope, TemplateScope, ClassScope, EnumScope,
-                 FunctionScope, BlockScope };
-enum EntityKind { NamespaceEntity, ClassEntity, EnumEntity, AliasNamespaceEntity };
-enum BindingKind { TypeBinding, AliasBinding, EnumeratorBinding,
-                   FunctionBinding, VariableBinding, ParameterBinding,
-                   NamespaceBinding, TemplateNameBinding };
-
-struct Scope
+struct TypeIndexEntry
 {
-  ScopeKind kind;
-  std::string name;
-  Id parent;
-  Id entity;
-  bool inline_namespace;
-  std::vector<Id> bindings;
-  std::vector<Id> output_order;
-  std::vector<Id> children;
-  std::vector<Id> using_directives;
-  std::unordered_map<Id, std::vector<Id> > index;
+  std::size_t hash;
+  Id type;
+  bool occupied;
+  TypeIndexEntry() : hash(0), type(none), occupied(false) {}
+};
+
+class TypeIndex
+{
+public:
+  TypeIndex() : size_(0) {}
+
+  Id find(const TypeKey& key, const std::vector<Type>& types) const
+  {
+    if (entries_.empty()) return none;
+    const std::size_t hash = TypeKeyHash()(key);
+    std::size_t slot = hash & (entries_.size() - 1);
+    for (std::size_t n = 0; n < entries_.size(); ++n) {
+      const TypeIndexEntry& entry = entries_[slot];
+      if (!entry.occupied) return none;
+      if (entry.hash == hash && same_type(key, types[entry.type]))
+        return entry.type;
+      slot = (slot + 1) & (entries_.size() - 1);
+    }
+    return none;
+  }
+
+  void set(std::size_t hash, Id type)
+  {
+    if (entries_.empty()) entries_.resize(8);
+    std::size_t slot = hash & (entries_.size() - 1);
+    if ((size_ + 1) * 4 > entries_.size() * 3) {
+      rehash(entries_.size() * 2);
+      slot = hash & (entries_.size() - 1);
+    }
+    while (entries_[slot].occupied) slot = (slot + 1) & (entries_.size() - 1);
+    entries_[slot].hash = hash;
+    entries_[slot].type = type;
+    entries_[slot].occupied = true;
+    ++size_;
+  }
+
+private:
+  static bool same_type(const TypeKey& key, const Type& type)
+  {
+    return key.kind == type.kind && *key.atom == type.atom &&
+        key.base == type.base && key.entity == type.entity &&
+        key.declaration == type.declaration && key.bound == type.bound &&
+        key.variadic == type.variadic && key.member_const == type.member_const &&
+        key.member_volatile == type.member_volatile &&
+        key.ref_qualifier == type.ref_qualifier &&
+        *key.parameters == type.parameters;
+  }
+
+  std::vector<TypeIndexEntry> entries_;
+  std::size_t size_;
+
+  void rehash(std::size_t capacity)
+  {
+    std::vector<TypeIndexEntry> replacement(capacity);
+    for (std::size_t i = 0; i < entries_.size(); ++i) {
+      if (!entries_[i].occupied) continue;
+      std::size_t slot = entries_[i].hash & (capacity - 1);
+      while (replacement[slot].occupied) slot = (slot + 1) & (capacity - 1);
+      replacement[slot] = entries_[i];
+    }
+    entries_.swap(replacement);
+  }
+};
+
+std::size_t hash_id(Id key)
+{
+  key ^= key >> 30;
+  key *= static_cast<Id>(0xbf58476d1ce4e5b9ULL);
+  key ^= key >> 27;
+  key *= static_cast<Id>(0x94d049bb133111ebULL);
+  key ^= key >> 31;
+  return static_cast<std::size_t>(key);
+}
+
+template<typename Value>
+class FlatIdMap
+{
+public:
+  FlatIdMap() : size_(0) {}
+
+  const Value* find(Id key) const
+  {
+    const std::size_t count = capacity();
+    const Entry* entries = slots();
+    std::size_t slot = hash_id(key) & (count - 1);
+    for (std::size_t n = 0; n < count; ++n) {
+      const Entry& entry = entries[slot];
+      if (!entry.occupied) return 0;
+      if (entry.key == key) return &entry.value;
+      slot = (slot + 1) & (count - 1);
+    }
+    return 0;
+  }
+
+  void set(Id key, const Value& value)
+  {
+    std::size_t count = capacity();
+    Entry* entries = slots();
+    std::size_t slot = hash_id(key) & (count - 1);
+    for (std::size_t n = 0; n < count; ++n) {
+      Entry& entry = entries[slot];
+      if (!entry.occupied) break;
+      if (entry.key == key) { entry.value = value; return; }
+      slot = (slot + 1) & (count - 1);
+    }
+    if ((size_ + 1) * 4 > count * 3) {
+      rehash(count * 2);
+      count = capacity();
+      entries = slots();
+      slot = hash_id(key) & (count - 1);
+      while (entries[slot].occupied) slot = (slot + 1) & (count - 1);
+    }
+    entries[slot].key = key;
+    entries[slot].value = value;
+    entries[slot].occupied = true;
+    ++size_;
+  }
+
+private:
+  struct Entry
+  {
+    Id key;
+    Value value;
+    bool occupied;
+    Entry() : key(none), value(), occupied(false) {}
+  };
+
+  Entry inline_[4];
+  std::vector<Entry> expanded_;
+  std::size_t size_;
+
+  std::size_t capacity() const { return expanded_.empty() ? 4 : expanded_.size(); }
+  Entry* slots() { return expanded_.empty() ? inline_ : &expanded_[0]; }
+  const Entry* slots() const { return expanded_.empty() ? inline_ : &expanded_[0]; }
+
+  static void insert(Entry* entries, std::size_t count, const Entry& source)
+  {
+    std::size_t slot = hash_id(source.key) & (count - 1);
+    while (entries[slot].occupied) slot = (slot + 1) & (count - 1);
+    entries[slot] = source;
+  }
+
+  void rehash(std::size_t count)
+  {
+    std::vector<Entry> replacement(count);
+    const Entry* old = slots();
+    const std::size_t old_count = capacity();
+    for (std::size_t i = 0; i < old_count; ++i)
+      if (old[i].occupied)
+        insert(&replacement[0], count, old[i]);
+    expanded_.swap(replacement);
+  }
+};
+
+class NameIndex
+{
+public:
+  Id find(Id name) const
+  {
+    const Id* binding = entries_.find(name);
+    return binding ? *binding : none;
+  }
+  void set(Id name, Id binding) { entries_.set(name, binding); }
+
+private:
+  FlatIdMap<Id> entries_;
+};
+
+struct Scope : ScopeRecord
+{
+  NameIndex index;
   Scope(ScopeKind k = BlockScope, const std::string& n = std::string(),
         Id p = none, Id e = none)
-      : kind(k), name(n), parent(p), entity(e), inline_namespace(false) {}
-};
-
-struct Entity
-{
-  EntityKind kind;
-  std::string name;
-  std::string key;
-  Id scope;
-  Id type;
-  bool complete;
-  bool defined;
-  bool scoped_enum;
-  bool is_union;
-  std::string class_key;
-  Id underlying;
-  Entity() : kind(ClassEntity), scope(none), type(none), complete(false), defined(false),
-      scoped_enum(false), is_union(false), underlying(none) {}
-};
-
-struct Binding
-{
-  BindingKind kind;
-  Id name_id;
-  std::string name;
-  Id type;
-  Id entity;
-  Id scope;
-  bool output;
-  bool constexpr_object;
-  bool static_storage;
-  bool namespace_alias;
-  std::string display_override;
-  std::string type_override;
-  bool has_value;
-  long long value;
-  Binding() : kind(VariableBinding), name_id(none), type(none), entity(none),
-      scope(none), output(true), constexpr_object(false), static_storage(false),
-      namespace_alias(false), has_value(false), value(0) {}
+      : ScopeRecord(k, n, p, e) {}
 };
 
 struct ConstResult
@@ -144,13 +256,28 @@ struct ConstResult
       : valid(v), value(n), type(t), lvalue(l) {}
 };
 
+struct NameComponent
+{
+  Id identity;
+  std::string spelling;
+  NameComponent(Id id = none, const std::string& text = std::string())
+      : identity(id), spelling(text) {}
+};
+
+struct NamePath
+{
+  std::vector<NameComponent> components;
+  bool absolute;
+  bool has_template_id;
+  NamePath() : absolute(false), has_template_id(false) {}
+};
+
 class Analyzer
 {
 public:
-  explicit Analyzer(Ast& ast) : ast_(ast), global_(0), current_(0), unnamed_namespace_(none)
+  explicit Analyzer(Ast& ast) : ast_(ast), global_(0)
   {
     scopes_.push_back(Scope(NamespaceScope, "<global>"));
-    current_ = global_;
     fundamental("void"); fundamental("bool"); fundamental("char");
     fundamental("signed char"); fundamental("unsigned char");
     fundamental("short int"); fundamental("unsigned short int");
@@ -177,33 +304,38 @@ public:
     print_scope(global_, 1, out);
   }
 
+  const Ast& ast() const { return ast_; }
+  Id global_scope() const { return global_; }
+  std::size_t type_count() const { return types_.size(); }
+  std::size_t scope_count() const { return scopes_.size(); }
+  std::size_t entity_count() const { return entities_.size(); }
+  std::size_t binding_count() const { return bindings_.size(); }
+  const Type& type(Id id) const { return types_.at(id); }
+  const ScopeRecord& scope(Id id) const { return scopes_.at(id); }
+  const Entity& entity(Id id) const { return entities_.at(id); }
+  const Binding& binding(Id id) const { return bindings_.at(id); }
+  Id lookup_name(Id scope, const std::string& name, bool types_only,
+                 bool namespaces_only) const
+  { return resolve_name_binding(scope, name, types_only, namespaces_only); }
+
 private:
   Ast& ast_;
   std::vector<Type> types_;
-  std::unordered_map<TypeKey, Id, TypeKeyHash> type_ids_;
+  TypeIndex type_ids_;
   std::vector<Scope> scopes_;
   std::vector<Entity> entities_;
   std::vector<Binding> bindings_;
-  std::vector<std::pair<Id, Id> > incomplete_arrays_;
   Id global_;
-  Id current_;
-  Id unnamed_namespace_;
-  std::unordered_map<std::string, Id> named_namespace_entities_;
-  std::unordered_map<std::string, Id> class_entities_;
-  std::unordered_map<std::string, Id> enum_entities_;
-  std::unordered_map<Id, std::vector<Id> > predeclared_bindings_;
-  std::unordered_map<Id, Id> class_node_types_;
-  std::unordered_map<Id, Id> enum_node_types_;
-  std::unordered_map<Id, Id> class_tag_bindings_;
-  std::unordered_map<Id, Id> enum_tag_bindings_;
-  std::unordered_map<Id, Id> qualified_enum_output_bindings_;
-  std::unordered_map<Id, Id> qualified_enum_output_scopes_;
-  std::unordered_set<Id> class_members_analyzed_;
-  std::unordered_map<Id, std::string> pending_anonymous_names_;
-  std::unordered_map<Id, std::string> class_key_by_declaration_;
-  std::unordered_map<Id, std::string> enum_key_by_declaration_;
-  std::unordered_map<Id, Id> unnamed_namespace_by_parent_;
-  std::unordered_set<Id> anonymous_union_nodes_;
+  FlatIdMap<Id> class_node_types_;
+  FlatIdMap<Id> enum_node_types_;
+  FlatIdMap<Id> class_tag_bindings_;
+  FlatIdMap<Id> enum_tag_bindings_;
+  FlatIdMap<Id> qualified_enum_output_bindings_;
+  FlatIdMap<bool> class_members_analyzed_;
+  FlatIdMap<std::string> pending_anonymous_names_;
+  FlatIdMap<std::string> class_key_by_declaration_;
+  FlatIdMap<Id> unnamed_namespace_by_parent_;
+  FlatIdMap<bool> anonymous_union_nodes_;
 
   std::vector<Id> children(Id node) const
   {
@@ -223,15 +355,6 @@ private:
     return false;
   }
 
-  std::vector<Id> auxiliary_children(Id node) const
-  {
-    std::vector<Id> result;
-    if (node == none) return result;
-    for (Id c = ast_.nodes[node].first_aux_child; c != none; c = ast_.nodes[c].next_aux_sibling)
-      result.push_back(c);
-    return result;
-  }
-
   std::string text(Id node) const
   {
     if (node == none) return std::string();
@@ -239,6 +362,60 @@ private:
     if (n.composite != none) return ast_.composite_atoms[n.composite];
     if (n.atom != none && n.atom < ast_.tokens.size()) return ast_.tokens[n.atom].text.get();
     return std::string();
+  }
+
+  std::string name_component_spelling(Id node) const
+  {
+    if (node == none) return std::string();
+    std::string result = text(node);
+    for (Id c = ast_.nodes[node].first_child; c != none; c = ast_.nodes[c].next_sibling) {
+      if (ast_.nodes[c].kind != NNameComponentToken) continue;
+      const std::string part = text(c);
+      if (!result.empty() && !part.empty() &&
+          (std::isalpha(static_cast<unsigned char>(result[result.size() - 1])) ||
+           result[result.size() - 1] == '_') &&
+          (std::isalpha(static_cast<unsigned char>(part[0])) || part[0] == '_'))
+        result += ' ';
+      result += part;
+    }
+    return result;
+  }
+
+  NamePath name_path(Id node)
+  {
+    NamePath result;
+    if (node == none) return result;
+    for (Id part = ast_.nodes[node].first_aux_child; part != none;
+         part = ast_.nodes[part].next_aux_sibling) {
+      if (ast_.nodes[part].kind == NGlobalScope) {
+        result.absolute = true;
+        continue;
+      }
+      if (ast_.nodes[part].kind != NNameComponent) continue;
+      std::string spelling = name_component_spelling(part);
+      Id identity = none;
+      const Id atom = ast_.nodes[part].atom;
+      if (atom != none && atom < ast_.tokens.size() &&
+          spelling == ast_.tokens[atom].text.get())
+        identity = ast_.tokens[atom].identifier_id;
+      if (identity == none) identity = ast_.find_name(spelling);
+      if (identity == none && !spelling.empty()) identity = ast_.intern_name(spelling);
+      for (Id child = ast_.nodes[part].first_child; child != none;
+           child = ast_.nodes[child].next_sibling)
+        if (ast_.nodes[child].kind == NTemplateIdSyntax)
+          result.has_template_id = true;
+      result.components.push_back(NameComponent(identity, spelling));
+    }
+    if (!result.components.empty()) return result;
+
+    const AstNode& source = ast_.nodes[node];
+    if (source.atom != none && source.atom < ast_.tokens.size()) {
+      const ast_tokens::Token& token = ast_.tokens[source.atom];
+      if (token.category == ast_tokens::IdentifierToken && token.identifier_id != none)
+        result.components.push_back(NameComponent(token.identifier_id, token.text.get()));
+      return result;
+    }
+    return result;
   }
 
   Id name_id(const std::string& name)
@@ -250,14 +427,19 @@ private:
   Id intern(Type type)
   {
     TypeKey key;
-    key.kind = type.kind; key.atom = type.atom; key.base = type.base;
-    key.entity = type.entity; key.bound = type.bound; key.variadic = type.variadic;
-    key.parameters = type.parameters;
-    std::unordered_map<TypeKey, Id, TypeKeyHash>::const_iterator old = type_ids_.find(key);
-    if (old != type_ids_.end()) return old->second;
+    key.kind = type.kind; key.atom = &type.atom; key.base = type.base;
+    key.entity = type.entity; key.declaration = type.declaration;
+    key.bound = type.bound; key.variadic = type.variadic;
+    key.member_const = type.member_const;
+    key.member_volatile = type.member_volatile;
+    key.ref_qualifier = type.ref_qualifier;
+    key.parameters = &type.parameters;
+    const Id old = type_ids_.find(key, types_);
+    if (old != none) return old;
+    const std::size_t hash = TypeKeyHash()(key);
     const Id id = types_.size();
-    types_.push_back(type);
-    type_ids_.insert(std::make_pair(key, id));
+    types_.push_back(std::move(type));
+    type_ids_.set(hash, id);
     return id;
   }
 
@@ -271,9 +453,11 @@ private:
     Type t; t.kind = NamedType; t.entity = entity; return intern(t);
   }
 
-  Id template_parameter_type(const std::string& spelling)
+  Id template_parameter_type(const std::string& spelling, Id declaration)
   {
-    Type t; t.kind = TemplateParameterType; t.atom = spelling; return intern(t);
+    Type t; t.kind = TemplateParameterType; t.atom = spelling;
+    t.declaration = declaration;
+    return intern(t);
   }
 
   Id unary_type(TypeKind kind, Id base)
@@ -368,9 +552,10 @@ private:
     Binding binding; binding.kind = kind; binding.name = name;
     binding.name_id = name_id(name); binding.type = type; binding.entity = entity;
     binding.scope = scope; binding.output = output;
+    binding.previous_same_name = scopes_[scope].index.find(binding.name_id);
     const Id id = bindings_.size(); bindings_.push_back(binding);
     scopes_[scope].bindings.push_back(id);
-    scopes_[scope].index[binding.name_id].push_back(id);
+    scopes_[scope].index.set(binding.name_id, id);
     if (output) scopes_[scope].output_order.push_back(id);
     return id;
   }
@@ -386,15 +571,13 @@ private:
                          Id type, Id entity, bool output)
   {
     Id n = name_id(name);
-    std::unordered_map<Id, std::vector<Id> >::const_iterator i = scopes_[scope].index.find(n);
-    if (i != scopes_[scope].index.end()) {
-      for (std::size_t x = 0; x < i->second.size(); ++x) {
-        Binding& b = bindings_[i->second[x]];
-        if (b.kind == kind && (entity == none || b.entity == entity)) {
-          if (b.type == none) b.type = type;
-          if (output) set_binding_output(i->second[x], true);
-          return i->second[x];
-        }
+    for (Id prior = scopes_[scope].index.find(n); prior != none;
+         prior = bindings_[prior].previous_same_name) {
+      Binding& b = bindings_[prior];
+      if (b.kind == kind && (entity == none || b.entity == entity)) {
+        if (b.type == none) b.type = type;
+        if (output) set_binding_output(prior, true);
+        return prior;
       }
     }
     return add_binding(scope, kind, name, type, entity, output);
@@ -410,31 +593,34 @@ private:
   bool is_type_binding(BindingKind kind) const
   { return kind == TypeBinding || kind == AliasBinding || kind == TemplateNameBinding; }
 
-  Id local_lookup(Id scope, const std::string& name, bool types_only = false,
+  Id local_lookup(Id scope, Id name, bool types_only = false,
                   bool namespaces_only = false) const
   {
-    if (scope == none) return none;
-    const Id n = ast_.find_name(name);
-    if (n == none) return none;
-    std::unordered_map<Id, std::vector<Id> >::const_iterator it = scopes_[scope].index.find(n);
-    if (it == scopes_[scope].index.end()) return none;
-    for (std::vector<Id>::const_reverse_iterator b = it->second.rbegin(); b != it->second.rend(); ++b) {
-      const Binding& binding = bindings_[*b];
+    if (scope == none || name == none) return none;
+    for (Id b = scopes_[scope].index.find(name); b != none;
+         b = bindings_[b].previous_same_name) {
+      const Binding& binding = bindings_[b];
       if (namespaces_only) {
-        if (binding.kind == NamespaceBinding) return *b;
+        if (binding.kind == NamespaceBinding) return b;
         continue;
       }
       if (types_only) {
-        if (is_type_binding(binding.kind)) return *b;
+        if (is_type_binding(binding.kind)) return b;
         // An ordinary declaration hides a type of the same spelling.
         return none;
       }
-      return *b;
+      return b;
     }
     return none;
   }
 
-  void lookup_directives(Id scope, const std::string& name, bool types_only,
+  Id local_lookup(Id scope, const std::string& name, bool types_only = false,
+                  bool namespaces_only = false) const
+  {
+    return local_lookup(scope, ast_.find_name(name), types_only, namespaces_only);
+  }
+
+  void lookup_directives(Id scope, Id name, bool types_only,
                          bool namespaces_only, std::unordered_set<Id>& visited,
                          std::vector<Id>& result) const
   {
@@ -453,9 +639,10 @@ private:
     }
   }
 
-  Id lookup(Id scope, const std::string& name, bool types_only = false,
+  Id lookup(Id scope, Id name, bool types_only = false,
             bool namespaces_only = false) const
   {
+    if (name == none) return none;
     std::unordered_set<Id> visited;
     for (Id s = scope; s != none; s = scopes_[s].parent) {
       const Id local = local_lookup(s, name, types_only, namespaces_only);
@@ -509,8 +696,8 @@ private:
     return none;
   }
 
-  Id qualified_component(Id scope, const std::string& name, bool types_only,
-                         bool namespaces_only)
+  Id qualified_component(Id scope, Id name, bool types_only,
+                         bool namespaces_only) const
   {
     Id local = local_lookup(scope, name, types_only, namespaces_only);
     if (local != none) return local;
@@ -527,26 +714,29 @@ private:
     return none;
   }
 
-  Id resolve_name_binding(Id from, const std::string& spelling,
-                          bool types_only = false, bool namespaces_only = false)
+  Id resolve_name_binding(Id from, const NamePath& path,
+                          bool types_only = false,
+                          bool namespaces_only = false) const
   {
-    std::vector<std::string> parts = split_qualified(spelling);
-    if (parts.empty()) return none;
-    Id binding = none;
-    Id scope = is_absolute_name(spelling) ? global_ : from;
-    binding = lookup(scope, parts[0], parts.size() == 1 && types_only, namespaces_only);
+    if (path.components.empty()) return none;
+    Id scope = path.absolute ? global_ : from;
+    Id binding = lookup(scope, path.components[0].identity,
+                        path.components.size() == 1 && types_only,
+                        namespaces_only);
     if (binding == none) return none;
-    for (std::size_t i = 1; i < parts.size(); ++i) {
+    for (std::size_t i = 1; i < path.components.size(); ++i) {
       scope = namespace_scope_for_binding(binding);
       if (scope == none) return none;
-      const bool final_component = i + 1 == parts.size();
-      binding = qualified_component(scope, parts[i], final_component && types_only,
+      const bool final_component = i + 1 == path.components.size();
+      binding = qualified_component(scope, path.components[i].identity,
+                                    final_component && types_only,
                                     final_component && namespaces_only);
       if (binding == none) {
         std::unordered_set<Id> visited;
         std::vector<Id> found;
         for (std::size_t d = 0; d < scopes_[scope].using_directives.size(); ++d)
-          lookup_directives(scopes_[scope].using_directives[d], parts[i],
+          lookup_directives(scopes_[scope].using_directives[d],
+                            path.components[i].identity,
                             final_component && types_only,
                             final_component && namespaces_only, visited, found);
         if (found.size() == 1) binding = found[0];
@@ -557,36 +747,31 @@ private:
     return binding;
   }
 
-  Id resolve_type(Id scope, const std::string& name, bool elaborated_class = false)
+  Id resolve_name_binding(Id from, const std::string& spelling,
+                          bool types_only = false, bool namespaces_only = false) const
   {
-    Id b = resolve_name_binding(scope, name, true, false);
-    if (b == none && elaborated_class) {
-      Entity e; e.kind = ClassEntity; e.name = name; e.key = scope_key(scope, name);
-      e.class_key = "class"; e.complete = false;
-      Id eid = new_entity(e); e.type = named_type(eid); entities_[eid].type = e.type;
-      entities_[eid].scope = none;
-      add_binding(scope, TypeBinding, name, e.type, eid);
-      return e.type;
+    // Public lookup accepts a rendered spelling; source names use NamePath
+    // identities attached to their AST nodes and never enter this adapter.
+    std::vector<std::string> parts = split_qualified(spelling);
+    NamePath path;
+    path.absolute = is_absolute_name(spelling);
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+      const Id identity = ast_.find_name(parts[i]);
+      if (identity == none) return none;
+      path.components.push_back(NameComponent(identity, parts[i]));
     }
-    if (b == none) throw std::runtime_error("unknown type name: " + name);
-    if (!is_type_binding(bindings_[b].kind)) throw std::runtime_error("name does not denote a type");
-    return bindings_[b].type;
+    return resolve_name_binding(from, path, types_only, namespaces_only);
   }
 
-  std::string scope_key(Id scope, const std::string& name) const
+  Id resolve_type(Id scope, Id name_node)
   {
-    std::vector<std::string> names;
-    for (Id s = scope; s != none; s = scopes_[s].parent) {
-      if (!scopes_[s].name.empty() && scopes_[s].name != "<global>") names.push_back(scopes_[s].name);
-    }
-    std::string key;
-    for (std::vector<std::string>::reverse_iterator i = names.rbegin(); i != names.rend(); ++i) {
-      if (!key.empty()) key += "::";
-      key += *i;
-    }
-    if (!key.empty()) key += "::";
-    key += name;
-    return key;
+    const NamePath path = name_path(name_node);
+    const Id binding = resolve_name_binding(scope, path, true, false);
+    if (binding == none)
+      throw std::runtime_error("unknown type name: " + text(name_node));
+    if (!is_type_binding(bindings_[binding].kind))
+      throw std::runtime_error("name does not denote a type");
+    return bindings_[binding].type;
   }
 
   Id type_from_decl_spec(Id seq, Id scope, bool allow_declaration = true)
@@ -601,8 +786,7 @@ private:
       const NodeKind kind = ast_.nodes[node].kind;
       if (kind == NClassSpecifier) { base = "@" + number(process_class(node, scope, allow_declaration, allow_declaration)); continue; }
       if (kind == NClassForwardDeclaration) {
-        std::string name = text(node);
-        base = "@" + number(process_elaborated_class(node, scope, name)); continue;
+        base = "@" + number(process_elaborated_class(node, scope)); continue;
       }
       if (kind == NEnumSpecifier) { base = "@" + number(process_enum(node, scope, allow_declaration, allow_declaration)); continue; }
       if (kind == NDeclSpecifier) {
@@ -628,7 +812,7 @@ private:
             s == "inline" || s == "virtual" || s == "constexpr" || s == "friend" ||
             s == "register" || s == "mutable" || s == "explicit") continue;
         if (!base.empty()) throw std::runtime_error("multiple declaration types");
-        base = "@" + number(resolve_type(scope, s));
+        base = "@" + number(resolve_type(scope, node));
         continue;
       }
       if (kind == NDecltypeSpecifier) {
@@ -659,26 +843,27 @@ private:
     return qualified(result, is_const, is_volatile);
   }
 
-  Id process_elaborated_class(Id node, Id scope, const std::string& name)
+  Id process_elaborated_class(Id node, Id scope)
   {
-    if (name.empty()) throw std::runtime_error("unnamed elaborated class type");
-    const std::vector<std::string> parts = split_qualified(name);
-    const std::string leaf = parts.empty() ? name : parts.back();
-    Id search_scope = is_absolute_name(name) ? global_ : scope;
-    if (parts.size() > 1) {
-      const std::string prefix = name.substr(0, name.rfind("::"));
+    const NamePath path = name_path(node);
+    if (path.components.empty()) throw std::runtime_error("unnamed elaborated class type");
+    const NameComponent& leaf_component = path.components.back();
+    const std::string& leaf = leaf_component.spelling;
+    Id search_scope = path.absolute ? global_ : scope;
+    if (path.components.size() > 1) {
+      NamePath prefix = path;
+      prefix.components.pop_back();
+      prefix.has_template_id = false;
       const Id qualifier = resolve_name_binding(search_scope, prefix, false, false);
       search_scope = namespace_scope_for_binding(qualifier);
       if (search_scope == none) throw std::runtime_error("elaborated class qualifier is not a scope");
     }
-    const Id id = ast_.find_name(leaf);
+    const Id id = leaf_component.identity;
     for (Id s = search_scope; s != none; s = scopes_[s].parent) {
       if (id == none) break;
-      std::unordered_map<Id, std::vector<Id> >::const_iterator entries = scopes_[s].index.find(id);
-      if (entries == scopes_[s].index.end()) continue;
-      for (std::vector<Id>::const_reverse_iterator b = entries->second.rbegin();
-           b != entries->second.rend(); ++b) {
-        const Binding& binding = bindings_[*b];
+      for (Id b = scopes_[s].index.find(id); b != none;
+           b = bindings_[b].previous_same_name) {
+        const Binding& binding = bindings_[b];
         if (!is_type_binding(binding.kind) || binding.type >= types_.size() ||
             types_[binding.type].kind != NamedType) continue;
         const Id entity = types_[binding.type].entity;
@@ -686,15 +871,11 @@ private:
           return binding.type;
       }
     }
-    if (parts.size() > 1) throw std::runtime_error("unknown elaborated class type");
-    const std::string key = scope_key(scope, leaf);
-    Id eid;
-    std::unordered_map<std::string, Id>::iterator old = class_entities_.find(key);
-    if (old != class_entities_.end()) eid = old->second;
-    else {
-      Entity e; e.kind = ClassEntity; e.name = leaf; e.key = key; e.class_key = "class";
+    if (path.components.size() > 1) throw std::runtime_error("unknown elaborated class type");
+    Id eid = class_entity_in_scope(scope, id);
+    if (eid == none) {
+      Entity e; e.kind = ClassEntity; e.name = leaf; e.class_key = "class";
       eid = new_entity(e); entities_[eid].type = named_type(eid);
-      class_entities_[key] = eid;
       add_binding(scope, TypeBinding, leaf, entities_[eid].type, eid);
     }
     (void)node;
@@ -762,8 +943,10 @@ private:
     Id node;
     bool is_const;
     bool is_volatile;
-    DeclaratorAction(NodeKind k, Id n, bool c = false, bool v = false)
-        : kind(k), node(n), is_const(c), is_volatile(v) {}
+    RefQualifier ref_qualifier;
+    DeclaratorAction(NodeKind k, Id n, bool c = false, bool v = false,
+                     RefQualifier ref = NoRefQualifier)
+        : kind(k), node(n), is_const(c), is_volatile(v), ref_qualifier(ref) {}
   };
 
   void declarator_path(Id node, std::vector<DeclaratorAction>& actions, Id scope)
@@ -771,17 +954,27 @@ private:
     if (node == none) return;
     std::vector<DeclaratorAction> ptrs;
     Id last_pointer = none;
+    Id last_function = none;
     for (Id c = ast_.nodes[node].first_child; c != none; c = ast_.nodes[c].next_sibling) {
       const NodeKind kind = ast_.nodes[c].kind;
       if (kind == NNestedDeclarator || kind == NDeclarator || kind == NAbstractDeclarator)
         declarator_path(c, actions, scope);
-      else if (kind == NArraySuffix || kind == NParameterClause)
-        { actions.push_back(DeclaratorAction(kind, c)); last_pointer = none; }
+      else if (kind == NArraySuffix || kind == NParameterClause) {
+        actions.push_back(DeclaratorAction(kind, c));
+        last_pointer = none;
+        last_function = kind == NParameterClause ? actions.size() - 1 : none;
+      }
       else if (kind == NPtrOperator) {
         ptrs.push_back(DeclaratorAction(kind, c)); last_pointer = ptrs.size() - 1;
       } else if (kind == NCvQualifier && last_pointer != none) {
         if (text(c) == "const") ptrs[last_pointer].is_const = true;
         if (text(c) == "volatile") ptrs[last_pointer].is_volatile = true;
+      } else if (kind == NCvQualifier && last_function != none) {
+        if (text(c) == "const") actions[last_function].is_const = true;
+        if (text(c) == "volatile") actions[last_function].is_volatile = true;
+      } else if (kind == NRefQualifier && last_function != none) {
+        actions[last_function].ref_qualifier = text(c) == "&"
+            ? LvalueRefQualifier : RvalueRefQualifier;
       }
     }
     for (std::vector<DeclaratorAction>::reverse_iterator p = ptrs.rbegin(); p != ptrs.rend(); ++p)
@@ -824,16 +1017,23 @@ private:
       } else if (i->kind == NParameterClause) {
         if (types_[base].kind == FunctionType || types_[base].kind == ArrayType)
           throw std::runtime_error("function return type is invalid");
-        Id function = build_function_type(i->node, base, scope);
+        Id function = build_function_type(i->node, base, scope, i->is_const,
+                                          i->is_volatile, i->ref_qualifier);
         base = function;
       }
     }
     return base;
   }
 
-  Id build_function_type(Id clause, Id result_type, Id scope)
+  Id build_function_type(Id clause, Id result_type, Id scope,
+                         bool member_const = false,
+                         bool member_volatile = false,
+                         RefQualifier ref_qualifier = NoRefQualifier)
   {
     Type fn; fn.kind = FunctionType; fn.base = result_type;
+    fn.member_const = member_const;
+    fn.member_volatile = member_volatile;
+    fn.ref_qualifier = ref_qualifier;
     bool variadic = false;
     for (Id p = ast_.nodes[clause].first_child; p != none; p = ast_.nodes[p].next_sibling) {
       if (ast_.nodes[p].kind == NParameterPack) { variadic = true; continue; }
@@ -873,9 +1073,9 @@ private:
       const NodeKind k = ast_.nodes[p].kind;
       const std::string s = text(p);
       if (k == NCvQualifier) { if (s == "const") c = true; else if (s == "volatile") v = true; }
-      else if (k == NTypeName) named = resolve_type(scope, s);
+      else if (k == NTypeName) named = resolve_type(scope, p);
       else if (k == NTypeSpecifier) words.push_back(s);
-      else if (k == NClassForwardDeclaration) named = process_elaborated_class(p, scope, s);
+      else if (k == NClassForwardDeclaration) named = process_elaborated_class(p, scope);
       else if (k == NDecltypeSpecifier) {
         const std::vector<Id> e = children(p);
         if (e.empty()) throw std::runtime_error("missing decltype expression");
@@ -901,13 +1101,34 @@ private:
     return std::string();
   }
 
-  Id class_entity_in_scope(Id scope, const std::string& name) const
+  Id class_entity_in_scope(Id scope, Id name) const
   {
-    Id b = local_lookup(scope, name, true, false);
-    if (b == none || bindings_[b].type >= types_.size() ||
-        types_[bindings_[b].type].kind != NamedType) return none;
-    const Id e = types_[bindings_[b].type].entity;
-    return e < entities_.size() && entities_[e].kind == ClassEntity ? e : none;
+    if (name == none) return none;
+    for (Id i = scopes_[scope].index.find(name); i != none;
+         i = bindings_[i].previous_same_name) {
+      const Binding& binding = bindings_[i];
+      if (binding.kind != TypeBinding || binding.type >= types_.size() ||
+          types_[binding.type].kind != NamedType) continue;
+      const Id entity = types_[binding.type].entity;
+      if (entity < entities_.size() && entities_[entity].kind == ClassEntity)
+        return entity;
+    }
+    return none;
+  }
+
+  Id enum_entity_in_scope(Id scope, Id name) const
+  {
+    if (name == none) return none;
+    for (Id i = scopes_[scope].index.find(name); i != none;
+         i = bindings_[i].previous_same_name) {
+      const Binding& binding = bindings_[i];
+      if (binding.kind != TypeBinding || binding.type >= types_.size() ||
+          types_[binding.type].kind != NamedType) continue;
+      const Id entity = types_[binding.type].entity;
+      if (entity < entities_.size() && entities_[entity].kind == EnumEntity)
+        return entity;
+    }
+    return none;
   }
 
   bool unnamed_union(Id node) const
@@ -933,33 +1154,36 @@ private:
 
   Id process_class(Id node, Id scope, bool emit, bool process_members)
   {
-    std::unordered_map<Id, Id>::const_iterator known_node = class_node_types_.find(node);
-    if (known_node != class_node_types_.end()) {
-      const Id type = known_node->second;
+    const Id* known_node = class_node_types_.find(node);
+    if (known_node) {
+      const Id type = *known_node;
       const Id eid = types_[type].entity;
-      const std::unordered_map<Id, Id>::const_iterator tag = class_tag_bindings_.find(node);
-      if (emit && tag != class_tag_bindings_.end()) set_binding_output(tag->second, true);
-      if (process_members && entities_[eid].complete && class_members_analyzed_.insert(eid).second)
+      const Id* tag = class_tag_bindings_.find(node);
+      if (emit && tag) set_binding_output(*tag, true);
+      if (process_members && entities_[eid].complete &&
+          !class_members_analyzed_.find(eid)) {
+        class_members_analyzed_.set(eid, true);
         analyze_class_members(node, entities_[eid].scope);
+      }
       return type;
     }
 
     if (scopes_[scope].kind == NamespaceScope && unnamed_union(node) &&
-        anonymous_union_nodes_.find(node) == anonymous_union_nodes_.end())
+        !anonymous_union_nodes_.find(node))
       throw std::runtime_error("namespace anonymous union requires static");
 
-    std::string name = ast_.nodes[node].composite == none ? std::string() : text(node);
-    std::unordered_map<Id, std::string>::const_iterator pending = pending_anonymous_names_.find(node);
-    if (name.empty() && pending != pending_anonymous_names_.end()) name = pending->second;
-    std::string key = name.empty() ? std::string("<anonymous>") : scope_key(scope, name);
+    const NamePath class_path = name_path(node);
+    std::string name = class_path.components.empty()
+        ? std::string() : class_path.components.back().spelling;
+    const std::string* pending = pending_anonymous_names_.find(node);
+    if (name.empty() && pending) name = *pending;
+    const Id name_key = class_path.components.empty()
+        ? (name.empty() ? none : name_id(name))
+        : class_path.components.back().identity;
     Id eid = none;
-    if (!name.empty()) {
-      std::unordered_map<std::string, Id>::iterator found = class_entities_.find(key);
-      if (found != class_entities_.end()) eid = found->second;
-      else eid = class_entity_in_scope(scope, name);
-    }
+    if (!name.empty()) eid = class_entity_in_scope(scope, name_key);
     if (eid == none) {
-      Entity e; e.kind = ClassEntity; e.name = name; e.key = key;
+      Entity e; e.kind = ClassEntity; e.name = name;
       e.class_key = "class";
       const std::vector<Id> cs = children(node);
       for (std::size_t i = 0; i < cs.size(); ++i)
@@ -968,25 +1192,20 @@ private:
         }
       eid = new_entity(e);
       entities_[eid].type = named_type(eid);
-      if (!name.empty()) class_entities_[key] = eid;
-    }
-    if (name.empty()) {
-      entities_[eid].key = key + "@" + number(ast_.nodes[node].line) + ":" + number(ast_.nodes[node].column);
     }
     Id type = entities_[eid].type;
-    class_node_types_[node] = type;
+    class_node_types_.set(node, type);
     if (name.empty() && entities_[eid].is_union && scopes_[scope].kind == NamespaceScope) {
       const std::pair<std::size_t, std::size_t> location = anonymous_union_location(node);
       name = "__anonymous_union_type__" + number(location.first) + "_" + number(location.second);
       entities_[eid].name = name;
-      entities_[eid].key = scope_key(scope, name);
-      anonymous_union_nodes_.insert(node);
+      anonymous_union_nodes_.set(node, true);
     }
-    if (!name.empty() && anonymous_union_nodes_.find(node) == anonymous_union_nodes_.end()) {
+    if (!name.empty() && !anonymous_union_nodes_.find(node)) {
       Id b = add_binding(scope, TypeBinding, name, type, eid, emit);
-      class_tag_bindings_[node] = b;
-      std::unordered_map<Id, std::string>::const_iterator keydecl = class_key_by_declaration_.find(node);
-      if (keydecl != class_key_by_declaration_.end()) bindings_[b].display_override = keydecl->second;
+      class_tag_bindings_.set(node, b);
+      const std::string* keydecl = class_key_by_declaration_.find(node);
+      if (keydecl) bindings_[b].display_override = *keydecl;
       else {
         const std::vector<Id> parts = children(node);
         for (std::size_t i = 0; i < parts.size(); ++i)
@@ -1003,42 +1222,41 @@ private:
       entities_[eid].scope = new_scope(ClassScope, name, scope, eid);
     }
     if (entities_[eid].scope != none && !name.empty()) scopes_[entities_[eid].scope].name = name;
-    if (definition && process_members && class_members_analyzed_.insert(eid).second)
+    if (definition && process_members && !class_members_analyzed_.find(eid)) {
+      class_members_analyzed_.set(eid, true);
       analyze_class_members(node, entities_[eid].scope);
-    else if (definition && !process_members)
+    } else if (definition && !process_members)
       predeclare_class_member_types(node, entities_[eid].scope);
     return type;
   }
 
   Id process_class_forward(Id node, Id scope, bool emit)
   {
-    std::unordered_map<Id, Id>::const_iterator known = class_node_types_.find(node);
-    if (known != class_node_types_.end()) {
-      std::unordered_map<Id, Id>::const_iterator tag = class_tag_bindings_.find(node);
-      if (emit && tag != class_tag_bindings_.end()) set_binding_output(tag->second, true);
-      return known->second;
+    const Id* known = class_node_types_.find(node);
+    if (known) {
+      const Id* tag = class_tag_bindings_.find(node);
+      if (emit && tag) set_binding_output(*tag, true);
+      return *known;
     }
-    const std::string name = text(node);
-    if (name.empty()) throw std::runtime_error("unnamed class forward declaration");
-    const std::string key = scope_key(scope, name);
-    Id eid = class_entity_in_scope(scope, name);
+    const NamePath class_path = name_path(node);
+    if (class_path.components.empty())
+      throw std::runtime_error("unnamed class forward declaration");
+    const std::string name = class_path.components.back().spelling;
+    const Id name_key = class_path.components.back().identity;
+    Id eid = class_entity_in_scope(scope, name_key);
     if (eid == none) {
-      std::unordered_map<std::string, Id>::iterator i = class_entities_.find(key);
-      if (i != class_entities_.end()) eid = i->second;
-    }
-    if (eid == none) {
-      Entity e; e.kind = ClassEntity; e.name = name; e.key = key;
+      Entity e; e.kind = ClassEntity; e.name = name;
       const std::vector<Id> cs = children(node);
       for (std::size_t i = 0; i < cs.size(); ++i)
         if (ast_.nodes[cs[i]].kind == NClassKey) { e.class_key = text(cs[i]); break; }
-      eid = new_entity(e); entities_[eid].type = named_type(eid); class_entities_[key] = eid;
+      eid = new_entity(e); entities_[eid].type = named_type(eid);
     }
     Id binding = add_binding(scope, TypeBinding, name, entities_[eid].type, eid, emit);
-    class_tag_bindings_[node] = binding;
+    class_tag_bindings_.set(node, binding);
     const std::vector<Id> cs = children(node);
     for (std::size_t i = 0; i < cs.size(); ++i)
       if (ast_.nodes[cs[i]].kind == NClassKey) bindings_[binding].display_override = text(cs[i]);
-    class_node_types_[node] = entities_[eid].type;
+    class_node_types_.set(node, entities_[eid].type);
     return entities_[eid].type;
   }
 
@@ -1076,27 +1294,34 @@ private:
 
   Id process_enum(Id node, Id scope, bool emit, bool process_values)
   {
-    std::unordered_map<Id, Id>::const_iterator known = enum_node_types_.find(node);
-    if (known != enum_node_types_.end()) {
-      Id t = known->second, e = types_[t].entity;
-      std::unordered_map<Id, Id>::const_iterator tag = enum_tag_bindings_.find(node);
-      if (emit && tag != enum_tag_bindings_.end()) set_binding_output(tag->second, true);
+    const Id* known = enum_node_types_.find(node);
+    if (known) {
+      Id t = *known, e = types_[t].entity;
+      const Id* tag = enum_tag_bindings_.find(node);
+      if (emit && tag) set_binding_output(*tag, true);
       if (process_values && !entities_[e].defined) {
         add_enum_values(node, scope, e);
         const std::string raw = ast_.nodes[node].composite == none ? std::string() : text(node);
-        if (entities_[e].scoped_enum && raw.find("::") != std::string::npos)
+        const NamePath known_path = name_path(node);
+        if (entities_[e].scoped_enum &&
+            (known_path.absolute || known_path.components.size() > 1))
           add_qualified_enum_output(raw, e);
       }
       return t;
     }
-    std::string name = ast_.nodes[node].composite == none ? std::string() : text(node);
-    std::unordered_map<Id, std::string>::const_iterator pending = pending_anonymous_names_.find(node);
-    if (name.empty() && pending != pending_anonymous_names_.end()) name = pending->second;
+    const NamePath enum_path = name_path(node);
+    std::string name = enum_path.components.empty()
+        ? std::string() : enum_path.components.back().spelling;
+    const std::string* pending = pending_anonymous_names_.find(node);
+    if (name.empty() && pending) name = *pending;
     std::string raw_name = name;
-    if (name.find("::") != std::string::npos) {
-      name = name.substr(name.rfind("::") + 2);
-      scope = qualified_declaration_scope(scope, raw_name, name);
+    if (enum_path.absolute || enum_path.components.size() > 1) {
+      raw_name = text(node);
+      scope = qualified_declaration_scope(scope, enum_path, name);
     }
+    const Id name_key = enum_path.components.empty()
+        ? (name.empty() ? none : name_id(name))
+        : enum_path.components.back().identity;
     bool scoped = false;
     bool has_underlying = false;
     Id underlying = fundamental("int");
@@ -1116,33 +1341,21 @@ private:
       }
     }
     if (!name.empty() && !scoped && !definition && !has_underlying &&
-        raw_name.find("::") == std::string::npos) {
-      const Id visible = resolve_name_binding(scope, name, true, false);
+        !(enum_path.absolute || enum_path.components.size() > 1)) {
+      const Id visible = lookup(scope, name_key, true, false);
       if (visible != none && is_type_binding(bindings_[visible].kind) &&
           bindings_[visible].type < types_.size() &&
           types_[bindings_[visible].type].kind == NamedType &&
           entities_[types_[bindings_[visible].type].entity].kind == EnumEntity) {
-        enum_node_types_[node] = bindings_[visible].type;
+        enum_node_types_.set(node, bindings_[visible].type);
         return bindings_[visible].type;
       }
     }
-    std::string key = name.empty() ? scope_key(scope, "<anonymous-enum>") : scope_key(scope, name);
-    Id eid = none;
-    if (!name.empty()) {
-      std::unordered_map<std::string, Id>::iterator old = enum_entities_.find(key);
-      if (old != enum_entities_.end()) eid = old->second;
-      if (eid == none) {
-        Id b = local_lookup(scope, name, true, false);
-        if (b != none && bindings_[b].type < types_.size() && types_[bindings_[b].type].kind == NamedType &&
-            entities_[types_[bindings_[b].type].entity].kind == EnumEntity)
-          eid = types_[bindings_[b].type].entity;
-      }
-    }
+    Id eid = name.empty() ? none : enum_entity_in_scope(scope, name_key);
     if (eid == none) {
-      Entity e; e.kind = EnumEntity; e.name = name; e.key = key;
+      Entity e; e.kind = EnumEntity; e.name = name;
       e.scoped_enum = scoped; e.underlying = underlying;
       eid = new_entity(e); entities_[eid].type = named_type(eid);
-      if (!name.empty()) enum_entities_[key] = eid;
     }
     Entity& e = entities_[eid];
     if (e.scoped_enum != scoped && (e.defined || scoped))
@@ -1151,20 +1364,22 @@ private:
       throw std::runtime_error("incompatible enum underlying type");
     if (!name.empty()) {
       Id b = local_lookup(scope, name, true, false);
-      if ((b == none || bindings_[b].entity != eid) && raw_name.find("::") == std::string::npos) {
+      if ((b == none || bindings_[b].entity != eid) &&
+          !(enum_path.absolute || enum_path.components.size() > 1)) {
         Id tag = add_binding(scope, TypeBinding, name, e.type, eid, emit);
-        enum_tag_bindings_[node] = tag;
+        enum_tag_bindings_.set(node, tag);
       } else if (b != none && bindings_[b].entity == eid && emit) {
-        set_binding_output(b, true); enum_tag_bindings_[node] = b;
+        set_binding_output(b, true); enum_tag_bindings_.set(node, b);
       }
     }
     if (!name.empty() && !scoped && !definition && !has_underlying && !e.complete)
       throw std::runtime_error("opaque unscoped enum requires an underlying type");
     if (scoped && e.scope == none) e.scope = new_scope(EnumScope, name, scope, eid);
-    enum_node_types_[node] = e.type;
+    enum_node_types_.set(node, e.type);
     if ((scoped || has_underlying) && !definition) e.complete = true;
     if (definition && process_values) {
-      const bool qualified_scoped_definition = scoped && raw_name.find("::") != std::string::npos;
+      const bool qualified_scoped_definition = scoped &&
+          (enum_path.absolute || enum_path.components.size() > 1);
       add_enum_values(node, scope, eid, !qualified_scoped_definition);
       if (qualified_scoped_definition) add_qualified_enum_output(raw_name, eid);
     }
@@ -1196,7 +1411,12 @@ private:
         if (!value.valid) throw std::runtime_error("invalid enumerator constant expression");
         next = value.value;
       }
-      const Id b = add_binding(binding_scope, EnumeratorBinding, text(item), e.type, eid, output);
+      Entity value_entity; value_entity.kind = EnumeratorEntity;
+      value_entity.name = text(item); value_entity.scope = binding_scope;
+      value_entity.type = e.type;
+      const Id value_id = new_entity(value_entity);
+      const Id b = add_binding(binding_scope, EnumeratorBinding, text(item), e.type,
+                                value_id, output);
       bindings_[b].has_value = true;
       bindings_[b].value = next;
       if (next == LLONG_MAX) throw std::runtime_error("enumerator value overflow");
@@ -1206,14 +1426,13 @@ private:
 
   void add_qualified_enum_output(const std::string& raw_name, Id eid)
   {
-    if (qualified_enum_output_bindings_.find(eid) != qualified_enum_output_bindings_.end()) return;
+    if (qualified_enum_output_bindings_.find(eid)) return;
     std::string qualified_name = raw_name;
     while (qualified_name.compare(0, 2, "::") == 0) qualified_name.erase(0, 2);
     const Id binding = add_binding(global_, TypeBinding, qualified_name, entities_[eid].type, eid, true);
     bindings_[binding].type_override = "enum class " + qualified_name;
-    qualified_enum_output_bindings_[eid] = binding;
+    qualified_enum_output_bindings_.set(eid, binding);
     const Id view = new_scope(EnumScope, qualified_name, global_, eid);
-    qualified_enum_output_scopes_[eid] = view;
     const Id semantic_scope = entities_[eid].scope;
     if (semantic_scope == none) return;
     const std::vector<Id> values = scopes_[semantic_scope].bindings;
@@ -1228,30 +1447,41 @@ private:
     }
   }
 
-  Id qualified_declaration_scope(Id starting, const std::string& qualified_name,
+  Id qualified_declaration_scope(Id starting, const NamePath& path,
                                  std::string& leaf)
   {
-    std::vector<std::string> parts = split_qualified(qualified_name);
-    if (parts.empty()) { leaf = qualified_name; return starting; }
-    leaf = parts.back();
-    if (parts.size() == 1) return starting;
-    Id scope = is_absolute_name(qualified_name) ? global_ : starting;
-    Id b = lookup(scope, parts[0], false, true);
-    if (b == none) b = lookup(scope, parts[0], true, false);
-    if (b == none) throw std::runtime_error("unknown qualified declaration scope");
-    for (std::size_t i = 1; i + 1 < parts.size(); ++i) {
-      scope = namespace_scope_for_binding(b);
-      if (scope == none) throw std::runtime_error("qualified name does not name a scope");
-      b = local_lookup(scope, parts[i], false, true);
-      if (b == none) b = local_lookup(scope, parts[i], true, false);
-      if (b == none) throw std::runtime_error("unknown qualified declaration scope");
+    if (path.components.empty()) {
+      leaf.clear();
+      return starting;
     }
-    scope = namespace_scope_for_binding(b);
-    if (scope == none) throw std::runtime_error("qualified name does not name a scope");
+    leaf = path.components.back().spelling;
+    if (path.components.size() == 1)
+      return path.absolute ? global_ : starting;
+
+    Id scope = path.absolute ? global_ : starting;
+    Id binding = lookup(scope, path.components[0].identity, false, true);
+    if (binding == none)
+      binding = lookup(scope, path.components[0].identity, true, false);
+    if (binding == none)
+      throw std::runtime_error("unknown qualified declaration scope");
+    for (std::size_t i = 1; i + 1 < path.components.size(); ++i) {
+      scope = namespace_scope_for_binding(binding);
+      if (scope == none)
+        throw std::runtime_error("qualified name does not name a scope");
+      binding = local_lookup(scope, path.components[i].identity, false, true);
+      if (binding == none)
+        binding = local_lookup(scope, path.components[i].identity, true, false);
+      if (binding == none)
+        throw std::runtime_error("unknown qualified declaration scope");
+    }
+    scope = namespace_scope_for_binding(binding);
+    if (scope == none)
+      throw std::runtime_error("qualified name does not name a scope");
     bool encloses = false;
     for (Id s = scope; s != none; s = scopes_[s].parent)
       if (s == starting) { encloses = true; break; }
-    if (!encloses) throw std::runtime_error("qualified definition is outside an enclosing scope");
+    if (!encloses)
+      throw std::runtime_error("qualified definition is outside an enclosing scope");
     return scope;
   }
 
@@ -1273,12 +1503,9 @@ private:
     const Id eid = types_[type].entity;
     if (eid >= entities_.size() || !entities_[eid].name.empty()) return type;
     entities_[eid].name = name;
-    entities_[eid].key = scope_key(scope, name);
     if (entities_[eid].scope != none) scopes_[entities_[eid].scope].name = name;
     BindingKind kind = TypeBinding;
     add_or_find_binding(scope, kind, name, type, eid, output);
-    if (entities_[eid].kind == EnumEntity) enum_entities_[entities_[eid].key] = eid;
-    else if (entities_[eid].kind == ClassEntity) class_entities_[entities_[eid].key] = eid;
     return type;
   }
 
@@ -1296,15 +1523,16 @@ private:
         const std::vector<Id> cs = children(spec);
         for (std::size_t i = 0; i < cs.size(); ++i) {
           if (ast_.nodes[cs[i]].kind == NClassKey) {
-            class_key_by_declaration_[spec] = text(cs[i]);
+            class_key_by_declaration_.set(spec, text(cs[i]));
             if (text(cs[i]) == "union" && n.empty() && first_name.empty() &&
-                scopes_[scope].kind == NamespaceScope) anonymous_union_nodes_.insert(spec);
+                scopes_[scope].kind == NamespaceScope)
+              anonymous_union_nodes_.set(spec, true);
           }
         }
-        if (n.empty() && !first_name.empty()) pending_anonymous_names_[spec] = first_name;
+        if (n.empty() && !first_name.empty()) pending_anonymous_names_.set(spec, first_name);
       } else if (ast_.nodes[spec].kind == NEnumSpecifier) {
-        enum_key_by_declaration_[spec] = std::string();
-        if (ast_.nodes[spec].composite == none && !first_name.empty()) pending_anonymous_names_[spec] = first_name;
+        if (ast_.nodes[spec].composite == none && !first_name.empty())
+          pending_anonymous_names_.set(spec, first_name);
       }
     }
     const bool is_typedef = has_specifier(seq, "typedef");
@@ -1313,7 +1541,7 @@ private:
     Id base = type_from_decl_spec(seq, scope, emit);
     bool anonymous_union = false;
     for (Id spec = ast_.nodes[seq].first_child; spec != none; spec = ast_.nodes[spec].next_sibling)
-      if (ast_.nodes[spec].kind == NClassSpecifier && anonymous_union_nodes_.find(spec) != anonymous_union_nodes_.end())
+      if (ast_.nodes[spec].kind == NClassSpecifier && anonymous_union_nodes_.find(spec))
         anonymous_union = true;
     if (anonymous_union && !has_specifier(seq, "static"))
       throw std::runtime_error("namespace anonymous union requires static");
@@ -1326,8 +1554,11 @@ private:
       if (declarator == none || ast_.nodes[declarator].kind != NDeclarator) continue;
       const std::string raw_name = declared_name(declarator);
       if (raw_name.empty()) continue;
+      const NamePath declared_path = name_path(declared_identifier_node(declarator));
       std::string name = raw_name;
-      Id target_scope = qualified_declaration_scope(scope, raw_name, name);
+      Id target_scope = qualified_declaration_scope(scope, declared_path, name);
+      const Id declared_name_id = declared_path.components.empty()
+          ? name_id(name) : declared_path.components.back().identity;
       reject_namespace_name_conflict(target_scope, name);
       Id type = build_declarator(declarator, base, target_scope);
       if (is_constexpr && types_[type].kind != FunctionType)
@@ -1348,11 +1579,11 @@ private:
       if ((types_[type].kind == LvalueReferenceType || types_[type].kind == RvalueReferenceType) &&
           !has_initializer && !is_extern && scopes_[target_scope].kind != ClassScope)
         throw std::runtime_error("reference object is not initialized");
-      if (types_[type].kind == ArrayType && types_[type].bound == 0)
-        incomplete_arrays_.push_back(std::make_pair(target_scope, name_id(name)));
-      BindingKind kind = types_[type].kind == FunctionType ? FunctionBinding : VariableBinding;
-      Id b = add_binding(target_scope, kind, name, type, none, emit);
-      bindings_[b].constexpr_object = is_constexpr;
+      const BindingKind kind = types_[type].kind == FunctionType ? FunctionBinding : VariableBinding;
+      const Id entity = kind == FunctionBinding
+          ? function_entity(target_scope, name, declared_name_id, type)
+          : object_entity(target_scope, name, declared_name_id, type);
+      Id b = add_binding(target_scope, kind, name, type, entity, emit);
       bindings_[b].static_storage = has_specifier(seq, "static");
       if (has_initializer && (is_constexpr || is_const_type(type) ||
           types_[type].kind == LvalueReferenceType || types_[type].kind == RvalueReferenceType)) {
@@ -1381,7 +1612,6 @@ private:
       if (source.kind != VariableBinding) continue;
       Id b = add_binding(scope, VariableBinding, source.name, source.type, source.entity, true);
       bindings_[b].has_value = source.has_value; bindings_[b].value = source.value;
-      bindings_[b].constexpr_object = source.constexpr_object;
     }
   }
 
@@ -1392,6 +1622,95 @@ private:
       return types_[type].atom.find('c') != std::string::npos;
     if (types_[type].kind == ArrayType) return is_const_type(types_[type].base);
     return false;
+  }
+
+  Id canonical_function_type(Id type)
+  {
+    if (type >= types_.size() || types_[type].kind != FunctionType)
+      throw std::runtime_error("function declaration has a non-function type");
+    Type canonical = types_[type];
+    canonical.parameters.clear();
+    for (std::size_t i = 0; i < types_[type].parameters.size(); ++i) {
+      Id parameter = types_[type].parameters[i];
+      if (types_[parameter].kind == QualifiedType)
+        parameter = types_[parameter].base;
+      if (types_[parameter].kind == ArrayType)
+        parameter = unary_type(PointerType, types_[parameter].base);
+      else if (types_[parameter].kind == FunctionType)
+        parameter = unary_type(PointerType, parameter);
+      canonical.parameters.push_back(parameter);
+    }
+    return intern(canonical);
+  }
+
+  bool same_function_parameters(Id left, Id right) const
+  {
+    if (left >= types_.size() || right >= types_.size()) return false;
+    const Type& a = types_[left];
+    const Type& b = types_[right];
+    return a.kind == FunctionType && b.kind == FunctionType &&
+        a.variadic == b.variadic && a.parameters == b.parameters &&
+        a.member_const == b.member_const &&
+        a.member_volatile == b.member_volatile &&
+        a.ref_qualifier == b.ref_qualifier;
+  }
+
+  Id function_entity(Id scope, const std::string& name, Id source_type)
+  { return function_entity(scope, name, name_id(name), source_type); }
+
+  Id function_entity(Id scope, const std::string& name, Id name_key,
+                     Id source_type)
+  {
+    const Id signature = canonical_function_type(source_type);
+    for (Id i = scopes_[scope].index.find(name_key); i != none;
+         i = bindings_[i].previous_same_name) {
+      const Binding& prior = bindings_[i];
+      if (prior.kind != FunctionBinding || prior.entity >= entities_.size() ||
+          entities_[prior.entity].kind != FunctionEntity) continue;
+      const Id prior_signature = entities_[prior.entity].type;
+      if (!same_function_parameters(prior_signature, signature)) continue;
+      if (types_[prior_signature].base != types_[signature].base)
+        throw std::runtime_error("incompatible function return type");
+      return prior.entity;
+    }
+    Entity entity; entity.kind = FunctionEntity; entity.name = name;
+    entity.scope = scope; entity.type = signature;
+    return new_entity(entity);
+  }
+
+  Id object_entity(Id scope, const std::string& name, Id type)
+  { return object_entity(scope, name, name_id(name), type); }
+
+  Id object_entity(Id scope, const std::string& name, Id name_key, Id type)
+  {
+    for (Id i = scopes_[scope].index.find(name_key); i != none;
+         i = bindings_[i].previous_same_name) {
+      const Binding& prior = bindings_[i];
+      if (prior.kind != VariableBinding || prior.entity >= entities_.size() ||
+          entities_[prior.entity].kind != ObjectEntity ||
+          entities_[prior.entity].scope != scope) continue;
+      Entity& entity = entities_[prior.entity];
+      if (entity.type == type) return prior.entity;
+      if (entity.type < types_.size() && type < types_.size() &&
+          types_[entity.type].kind == ArrayType && types_[type].kind == ArrayType) {
+        const Id merged = merge_array_type(entity.type, type);
+        if (merged != none) {
+          entity.type = merged;
+          return prior.entity;
+        }
+      }
+      throw std::runtime_error("incompatible object redeclaration");
+    }
+    Entity entity; entity.kind = ObjectEntity; entity.name = name;
+    entity.scope = scope; entity.type = type;
+    return new_entity(entity);
+  }
+
+  Id parameter_entity(Id scope, const std::string& name, Id type)
+  {
+    Entity entity; entity.kind = ObjectEntity; entity.name = name;
+    entity.scope = scope; entity.type = type;
+    return new_entity(entity);
   }
 
   Id closest_parameter_clause(Id declarator, Id scope)
@@ -1417,7 +1736,8 @@ private:
         name = declared_name(declarator);
         type = build_declarator(declarator, type, fn_scope);
       }
-      add_binding(fn_scope, ParameterBinding, name, type, none, true);
+      add_binding(fn_scope, ParameterBinding, name, type,
+                  parameter_entity(fn_scope, name, type), true);
     }
   }
 
@@ -1428,12 +1748,16 @@ private:
     if (seq == none || declarator == none) return;
     const Id base = type_from_decl_spec(seq, scope);
     const std::string raw_name = declared_name(declarator);
+    const NamePath declared_path = name_path(declared_identifier_node(declarator));
     std::string name = raw_name;
-    const Id target_scope = qualified_declaration_scope(scope, raw_name, name);
+    const Id target_scope = qualified_declaration_scope(scope, declared_path, name);
     const Id type = build_declarator(declarator, base, target_scope);
     if (types_[type].kind != FunctionType) throw std::runtime_error("function definition declarator is not a function");
     reject_namespace_name_conflict(target_scope, name);
-    add_binding(target_scope, FunctionBinding, name, type, none, true);
+    const Id declared_name_id = declared_path.components.empty()
+        ? name_id(name) : declared_path.components.back().identity;
+    const Id entity = function_entity(target_scope, name, declared_name_id, type);
+    add_binding(target_scope, FunctionBinding, name, type, entity, true);
     const Id fn_scope = new_scope(FunctionScope, name, target_scope);
     const Id clause = closest_parameter_clause(declarator, target_scope);
     add_function_parameters(clause, fn_scope);
@@ -1474,7 +1798,7 @@ private:
     const Id callee = ast_.nodes[node].first_child;
     if (callee == none || (ast_.nodes[callee].kind != NIdExpression &&
         ast_.nodes[callee].kind != NIdentifier)) return;
-    const Id binding = resolve_name_binding(scope, text(callee), true, false);
+    const Id binding = resolve_name_binding(scope, name_path(callee), true, false);
     if (binding == none || !is_type_binding(bindings_[binding].kind) ||
         bindings_[binding].type >= types_.size() ||
         types_[bindings_[binding].type].kind != NamedType) return;
@@ -1482,13 +1806,14 @@ private:
     if (entity >= entities_.size() || entities_[entity].kind != ClassEntity ||
         entities_[entity].scope == none) return;
     const Id class_scope = entities_[entity].scope;
+    const Id class_name = ast_.find_name(entities_[entity].name);
     for (std::size_t i = 0; i < scopes_[class_scope].bindings.size(); ++i) {
       const Binding& member = bindings_[scopes_[class_scope].bindings[i]];
-      if (member.kind == FunctionBinding && member.name == entities_[entity].name) return;
+      if (member.kind == FunctionBinding && member.name_id == class_name) return;
     }
     for (std::size_t i = 0; i < scopes_[class_scope].children.size(); ++i) {
       const Scope& child = scopes_[scopes_[class_scope].children[i]];
-      if (child.kind == FunctionScope && child.name == entities_[entity].name) return;
+      if (child.kind == FunctionScope && ast_.find_name(child.name) == class_name) return;
     }
     new_scope(FunctionScope, entities_[entity].name, class_scope);
   }
@@ -1502,14 +1827,14 @@ private:
       if (ast_.nodes[body[i]].kind == NInlineMarker) is_inline = true;
     Id ns_scope = none, eid = none;
     if (name.empty()) {
-      std::unordered_map<Id, Id>::iterator prior = unnamed_namespace_by_parent_.find(parent);
-      if (prior == unnamed_namespace_by_parent_.end()) {
-        Entity e; e.kind = NamespaceEntity; e.name = "<unnamed>"; e.key = "<anonymous-namespace>";
+      const Id* prior = unnamed_namespace_by_parent_.find(parent);
+      if (!prior) {
+        Entity e; e.kind = NamespaceEntity; e.name = "<unnamed>";
         eid = new_entity(e); ns_scope = new_scope(NamespaceScope, "<unnamed>", parent, eid);
-        entities_[eid].scope = ns_scope; unnamed_namespace_ = ns_scope;
-        unnamed_namespace_by_parent_[parent] = ns_scope;
+        entities_[eid].scope = ns_scope;
+        unnamed_namespace_by_parent_.set(parent, ns_scope);
         scopes_[parent].using_directives.push_back(ns_scope);
-      } else { ns_scope = prior->second; eid = scopes_[ns_scope].entity; }
+      } else { ns_scope = *prior; eid = scopes_[ns_scope].entity; }
     } else {
       Id any = local_lookup(parent, name, false, false);
       if (any != none) {
@@ -1519,16 +1844,10 @@ private:
           throw std::runtime_error("namespace definition conflicts with a prior binding or alias");
         eid = bindings_[any].entity; ns_scope = entities_[eid].scope;
       } else {
-        const std::string key = scope_key(parent, name);
-        std::unordered_map<std::string, Id>::iterator prior = named_namespace_entities_.find(key);
-        if (prior != named_namespace_entities_.end()) eid = prior->second;
-        else {
-          Entity e; e.kind = NamespaceEntity; e.name = name; e.key = key;
-          eid = new_entity(e); named_namespace_entities_[key] = eid;
-        }
-        if (entities_[eid].scope == none) {
-          ns_scope = new_scope(NamespaceScope, name, parent, eid); entities_[eid].scope = ns_scope;
-        } else ns_scope = entities_[eid].scope;
+        Entity e; e.kind = NamespaceEntity; e.name = name;
+        eid = new_entity(e);
+        ns_scope = new_scope(NamespaceScope, name, parent, eid);
+        entities_[eid].scope = ns_scope;
         add_or_find_binding(parent, NamespaceBinding, name, none, eid, false);
       }
     }
@@ -1542,7 +1861,7 @@ private:
     const std::string alias = text(node);
     Id target = ast_.nodes[node].first_child;
     if (target == none) throw std::runtime_error("namespace alias has no target");
-    const Id b = resolve_name_binding(scope, text(target), false, true);
+    const Id b = resolve_name_binding(scope, name_path(target), false, true);
     if (b == none) throw std::runtime_error("namespace alias target is not a namespace");
     const Id eid = bindings_[b].entity;
     Id old = local_lookup(scope, alias, false, false);
@@ -1559,7 +1878,7 @@ private:
   {
     Id target = ast_.nodes[node].first_child;
     if (target == none) throw std::runtime_error("using directive without target");
-    Id b = resolve_name_binding(scope, text(target), false, true);
+    Id b = resolve_name_binding(scope, name_path(target), false, true);
     if (b == none) throw std::runtime_error("using directive target is not a namespace");
     Id nominated = entities_[bindings_[b].entity].scope;
     if (std::find(scopes_[scope].using_directives.begin(), scopes_[scope].using_directives.end(), nominated) ==
@@ -1570,13 +1889,14 @@ private:
   {
     Id target_node = ast_.nodes[node].first_child;
     if (target_node == none) throw std::runtime_error("using declaration without target");
-    const std::string target = text(target_node);
-    if (target.find('<') != std::string::npos) throw std::runtime_error("using declaration template-id is unsupported");
-    Id b = resolve_name_binding(scope, target, false, false);
+    const NamePath target_path = name_path(target_node);
+    if (target_path.has_template_id)
+      throw std::runtime_error("using declaration template-id is unsupported");
+    Id b = resolve_name_binding(scope, target_path, false, false);
     if (b == none) throw std::runtime_error("using declaration target not found");
     const Binding source = bindings_[b];
-    const std::size_t sep = target.rfind("::");
-    const std::string name = sep == std::string::npos ? target : target.substr(sep + 2);
+    const std::string name = target_path.components.empty()
+        ? source.name : target_path.components.back().spelling;
     if (is_type_binding(source.kind)) {
       add_binding(scope, source.kind, name, source.type, source.entity, true);
     } else if (source.kind == EnumeratorBinding) {
@@ -1587,7 +1907,6 @@ private:
     } else if (source.kind == VariableBinding || source.kind == ParameterBinding) {
       Id imported = add_binding(scope, VariableBinding, name, source.type, source.entity, true);
       bindings_[imported].has_value = source.has_value; bindings_[imported].value = source.value;
-      bindings_[imported].constexpr_object = source.constexpr_object;
     } else throw std::runtime_error("unsupported using declaration target");
   }
 
@@ -1624,7 +1943,7 @@ private:
           add_binding(templ_scope, binding_kind, name, type, none, true);
           continue;
         }
-        const Id t = template_parameter_type(spelling);
+        const Id t = template_parameter_type(spelling, p);
         add_binding(templ_scope, binding_kind, name, t, none, true);
       }
     }
@@ -1752,8 +2071,7 @@ private:
     if (k == NLiteral || k == NTaggedLiteral || k == NKeywordLiteral)
       return literal_value(node);
     if (k == NIdExpression || k == NIdentifier) {
-      const std::string name = text(node);
-      const Id b = resolve_name_binding(scope, name, false, false);
+      const Id b = resolve_name_binding(scope, name_path(node), false, false);
       if (b == none) return ConstResult();
       const Binding& binding = bindings_[b];
       if (binding.kind == EnumeratorBinding && binding.has_value)
@@ -1848,7 +2166,7 @@ private:
   {
     if (expression == none) throw std::runtime_error("empty decltype operand");
     if (ast_.nodes[expression].kind == NIdExpression || ast_.nodes[expression].kind == NIdentifier) {
-      Id b = resolve_name_binding(scope, text(expression), false, false);
+      Id b = resolve_name_binding(scope, name_path(expression), false, false);
       if (b == none) throw std::runtime_error("unknown decltype name");
       return bindings_[b].type;
     }
@@ -1915,25 +2233,16 @@ private:
   void finish_array_completions()
   {
     for (std::size_t s = 0; s < scopes_.size(); ++s) {
-      Scope& scope = scopes_[s];
+      const Scope& scope = scopes_[s];
       for (std::size_t i = 0; i < scope.bindings.size(); ++i) {
-        Binding& candidate = bindings_[scope.bindings[i]];
-        if (candidate.kind != VariableBinding || candidate.type >= types_.size() ||
-            types_[candidate.type].kind != ArrayType) continue;
-        Id complete = candidate.type;
-        for (std::size_t j = 0; j < scope.bindings.size(); ++j) {
-          const Binding& other = bindings_[scope.bindings[j]];
-          if (other.name_id != candidate.name_id || other.type >= types_.size() ||
-              types_[other.type].kind != ArrayType) continue;
-          complete = merge_array_type(complete, other.type);
-        }
-        if (complete != none) {
-          for (std::size_t j = 0; j < scope.bindings.size(); ++j)
-            if (bindings_[scope.bindings[j]].name_id == candidate.name_id &&
-                bindings_[scope.bindings[j]].kind == VariableBinding &&
-                types_[bindings_[scope.bindings[j]].type].kind == ArrayType)
-              bindings_[scope.bindings[j]].type = complete;
-        }
+        Binding& binding = bindings_[scope.bindings[i]];
+        if (binding.kind != VariableBinding || binding.type >= types_.size() ||
+            types_[binding.type].kind != ArrayType ||
+            binding.entity >= entities_.size() ||
+            entities_[binding.entity].kind != ObjectEntity) continue;
+        const Id completed = entities_[binding.entity].type;
+        if (completed < types_.size() && types_[completed].kind == ArrayType)
+          binding.type = completed;
       }
     }
   }
@@ -1973,7 +2282,8 @@ private:
     if (fn.parameters.size() == 1 && types_[fn.parameters[0]].kind == FundamentalType &&
         types_[fn.parameters[0]].atom == "void") fn.parameters.clear();
     const Id type = intern(fn);
-    add_binding(scope, FunctionBinding, name, type, none, true);
+    const Id entity = function_entity(scope, name, type);
+    add_binding(scope, FunctionBinding, name, type, entity, true);
     const Id fscope = new_scope(FunctionScope, name, scope);
     add_function_parameters(clause, fscope);
     Id body = ast_.nodes[node].first_child;
@@ -2057,6 +2367,67 @@ private:
 
 }  // namespace
 
+namespace pa6 {
+
+struct SemanticUnit::Impl
+{
+  Ast ast;
+  std::unique_ptr<Analyzer> analyzer;
+
+  explicit Impl(Ast&& source)
+      : ast(std::move(source)), analyzer(new Analyzer(ast))
+  {
+    analyzer->analyze();
+  }
+};
+
+SemanticUnit::SemanticUnit(std::unique_ptr<Impl> impl)
+    : impl_(std::move(impl))
+{}
+
+SemanticUnit::~SemanticUnit() {}
+
+SemanticUnit::SemanticUnit(SemanticUnit&& other)
+    : impl_(std::move(other.impl_))
+{}
+
+SemanticUnit& SemanticUnit::operator=(SemanticUnit&& other)
+{
+  impl_ = std::move(other.impl_);
+  return *this;
+}
+
+const Ast& SemanticUnit::ast() const { return impl_->analyzer->ast(); }
+Id SemanticUnit::global_scope() const { return impl_->analyzer->global_scope(); }
+std::size_t SemanticUnit::type_count() const { return impl_->analyzer->type_count(); }
+std::size_t SemanticUnit::scope_count() const { return impl_->analyzer->scope_count(); }
+std::size_t SemanticUnit::entity_count() const { return impl_->analyzer->entity_count(); }
+std::size_t SemanticUnit::binding_count() const { return impl_->analyzer->binding_count(); }
+const Type& SemanticUnit::type(Id id) const { return impl_->analyzer->type(id); }
+const ScopeRecord& SemanticUnit::scope(Id id) const { return impl_->analyzer->scope(id); }
+const Entity& SemanticUnit::entity(Id id) const { return impl_->analyzer->entity(id); }
+const Binding& SemanticUnit::binding(Id id) const { return impl_->analyzer->binding(id); }
+Id SemanticUnit::lookup(Id scope, const std::string& name, bool types_only,
+                        bool namespaces_only) const
+{
+  return impl_->analyzer->lookup_name(scope, name, types_only, namespaces_only);
+}
+void SemanticUnit::print(std::ostream& out) const { impl_->analyzer->print(out); }
+
+SemanticUnit AnalyzeTranslationUnit(Ast&& ast)
+{
+  return SemanticUnit(std::unique_ptr<SemanticUnit::Impl>(
+      new SemanticUnit::Impl(std::move(ast))));
+}
+
+SemanticUnit AnalyzeTranslationUnit(const std::string& path)
+{
+  Ast ast = ParseTranslationUnit(path);
+  return AnalyzeTranslationUnit(std::move(ast));
+}
+
+}  // namespace pa6
+
 void EmitTypes(const std::vector<std::string>& inputs, const std::string& output)
 {
   if (inputs.empty() || output.empty()) throw std::runtime_error("invalid --emit-types invocation");
@@ -2065,11 +2436,9 @@ void EmitTypes(const std::vector<std::string>& inputs, const std::string& output
   std::ostream& out = file;
   out << inputs.size() << " translation units\n";
   for (std::size_t i = 0; i < inputs.size(); ++i) {
-    Ast ast = ParseTranslationUnit(inputs[i]);
-    Analyzer analyzer(ast);
-    analyzer.analyze();
+    pa6::SemanticUnit unit = pa6::AnalyzeTranslationUnit(inputs[i]);
     out << "start translation unit " << i + 1 << "\n";
-    analyzer.print(out);
+    unit.print(out);
     out << "end translation unit\n";
   }
 }

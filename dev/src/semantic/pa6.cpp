@@ -367,6 +367,11 @@ public:
   Id make_qualified(Id type, bool is_const, bool is_volatile)
   { return qualified(type, is_const, is_volatile); }
   Id make_pointer(Id type) { return unary_type(PointerType, type); }
+  Id make_member_pointer(Id class_entity, Id member_type)
+  {
+    Type t; t.kind = MemberPointerType; t.entity = class_entity; t.base = member_type;
+    return intern(t);
+  }
   Id make_lvalue_reference(Id type) { return unary_type(LvalueReferenceType, type); }
   Id make_rvalue_reference(Id type) { return unary_type(RvalueReferenceType, type); }
   Id make_array(Id type, long long bound)
@@ -571,6 +576,9 @@ private:
       return q + type_spelling(t.base);
     }
     case PointerType: return "pointer to " + type_spelling(t.base);
+    case MemberPointerType:
+      return "member-pointer of " +
+          type_spelling(entities_.at(t.entity).type) + " to " + type_spelling(t.base);
     case LvalueReferenceType: return "lvalue-reference to " + type_spelling(t.base);
     case RvalueReferenceType: return "rvalue-reference to " + type_spelling(t.base);
     case ArrayType:
@@ -1067,6 +1075,20 @@ private:
             throw std::runtime_error("pointer to reference type is invalid");
           base = qualified(unary_type(PointerType, base), i->is_const, i->is_volatile);
         }
+        else if (op.size() >= 3 && op.compare(op.size() - 3, 3, "::*") == 0) {
+          const NamePath class_path = name_path(i->node);
+          const Id class_binding = resolve_name_binding(scope, class_path, true, false);
+          if (class_binding == none || class_binding >= bindings_.size() ||
+              bindings_[class_binding].type >= types_.size())
+            throw std::runtime_error("member pointer does not name a class");
+          const Id class_type = strip_qualified(bindings_[class_binding].type);
+          if (types_[class_type].kind != NamedType ||
+              types_[class_type].entity >= entities_.size() ||
+              entities_[types_[class_type].entity].kind != ClassEntity)
+            throw std::runtime_error("member pointer does not name a class");
+          base = qualified(make_member_pointer(types_[class_type].entity, base),
+                           i->is_const, i->is_volatile);
+        }
         else if (op == "&") {
           if (types_[base].kind == LvalueReferenceType || types_[base].kind == RvalueReferenceType)
             base = unary_type(LvalueReferenceType, types_[base].base);
@@ -1269,6 +1291,7 @@ private:
     if (!name.empty()) eid = class_entity_in_scope(scope, name_key);
     if (eid == none) {
       Entity e; e.kind = ClassEntity; e.name = name;
+      e.is_anonymous = class_path.components.empty();
       e.class_key = "class";
       const std::vector<Id> cs = children(node);
       for (std::size_t i = 0; i < cs.size(); ++i)
@@ -1305,6 +1328,21 @@ private:
       entities_[eid].complete = true;
       entities_[eid].defined = true;
       entities_[eid].scope = new_scope(ClassScope, name, scope, eid);
+      for (Id c = ast_.nodes[node].first_child; c != none; c = ast_.nodes[c].next_sibling) {
+        if (ast_.nodes[c].kind != NBaseClause) continue;
+        for (Id base = ast_.nodes[c].first_child; base != none;
+             base = ast_.nodes[base].next_sibling) {
+          if (ast_.nodes[base].kind != NBaseSpecifier) continue;
+          const Id base_name = ast_.nodes[base].first_child;
+          if (base_name == none) continue;
+          const Id base_type = strip_qualified(resolve_type(scope, base_name));
+          if (types_[base_type].kind != NamedType ||
+              types_[base_type].entity >= entities_.size() ||
+              entities_[types_[base_type].entity].kind != ClassEntity)
+            throw std::runtime_error("base specifier does not name a class");
+          entities_[eid].bases.push_back(types_[base_type].entity);
+        }
+      }
     }
     if (entities_[eid].scope != none && !name.empty()) scopes_[entities_[eid].scope].name = name;
     if (definition && process_members && !class_members_analyzed_.find(eid)) {
@@ -1901,8 +1939,43 @@ private:
     const std::string raw_name = declared_name(declarator);
     const NamePath declared_path = name_path(declared_identifier_node(declarator));
     std::string name = raw_name;
-    const Id target_scope = qualified_declaration_scope(scope, declared_path, name);
-    const Id type = build_declarator(declarator, base, target_scope);
+    Id target_scope = none;
+    bool qualified_constructor = false;
+    try {
+      target_scope = qualified_declaration_scope(scope, declared_path, name);
+    } catch (const std::runtime_error&) {
+      const Id class_type = strip_qualified(base);
+      if (types_[class_type].kind == NamedType &&
+          types_[class_type].entity < entities_.size() &&
+          entities_[types_[class_type].entity].kind == ClassEntity &&
+          entities_[types_[class_type].entity].scope != none &&
+          declared_path.components.size() >= 2) {
+        const Entity& leading_class = entities_[types_[class_type].entity];
+        Id search = leading_class.scope;
+        std::size_t first = 0;
+        if (declared_path.components[0].spelling == leading_class.name) first = 1;
+        bool resolved = true;
+        for (std::size_t i = first; i + 1 < declared_path.components.size(); ++i) {
+          const Id member_type = local_lookup(search,
+              declared_path.components[i].identity, true, false);
+          if (member_type == none) { resolved = false; break; }
+          search = namespace_scope_for_binding(member_type);
+          if (search == none || scopes_[search].kind != ClassScope) {
+            resolved = false; break;
+          }
+        }
+        if (resolved && search < scopes_.size() && scopes_[search].kind == ClassScope &&
+            scopes_[search].entity < entities_.size() &&
+            declared_path.components.back().spelling == entities_[scopes_[search].entity].name) {
+          target_scope = search;
+          name = declared_path.components.back().spelling;
+          qualified_constructor = true;
+        }
+      }
+      if (target_scope == none) throw;
+    }
+    const Id result_type = qualified_constructor ? fundamental("void") : base;
+    const Id type = build_declarator(declarator, result_type, target_scope);
     if (types_[type].kind != FunctionType) throw std::runtime_error("function definition declarator is not a function");
     reject_namespace_name_conflict(target_scope, name);
     const Id declared_name_id = declared_path.components.empty()
@@ -2613,6 +2686,8 @@ Id SemanticUnit::fundamental_type(const std::string& name)
 Id SemanticUnit::qualified_type(Id type, bool is_const, bool is_volatile)
 { return impl_->analyzer->make_qualified(type, is_const, is_volatile); }
 Id SemanticUnit::pointer_type(Id type) { return impl_->analyzer->make_pointer(type); }
+Id SemanticUnit::member_pointer_type(Id class_entity, Id member_type)
+{ return impl_->analyzer->make_member_pointer(class_entity, member_type); }
 Id SemanticUnit::lvalue_reference_type(Id type)
 { return impl_->analyzer->make_lvalue_reference(type); }
 Id SemanticUnit::rvalue_reference_type(Id type)

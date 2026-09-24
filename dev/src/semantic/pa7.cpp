@@ -87,14 +87,34 @@ public:
   {
     facts_.resize(ast_.nodes.size());
     fact_ready_.assign(ast_.nodes.size(), false);
+    index_anonymous_types();
   }
 
   void print(std::ostream& out)
   {
     out_ = &out;
     out << "translation-unit\n";
+    for (Id node = 0; node < ast_.nodes.size(); ++node) {
+      if (ast_.nodes[node].kind != NFunctionDefinition) continue;
+      const Id binding = unit_.binding_for_node(node);
+      if (binding == none || binding >= unit_.binding_count()) continue;
+      const pa6::Binding& function = unit_.binding(binding);
+      if (unit_.scope(function.scope).kind == pa6::ClassScope)
+        member_definition_nodes_[binding] = node;
+    }
     for (Id c = ast_.nodes[0].first_child; c != none; c = ast_.nodes[c].next_sibling)
       emit_declaration(c, 1);
+    for (std::size_t i = 0; i < demanded_member_definitions_.size(); ++i) {
+      const Id binding = demanded_member_definitions_[i];
+      const std::unordered_map<Id, Id>::const_iterator definition =
+          member_definition_nodes_.find(binding);
+      if (definition == member_definition_nodes_.end()) continue;
+      const Id entity = unit_.binding(binding).entity;
+      if (defined_functions_.find(entity) != defined_functions_.end()) continue;
+      emit_function(definition->second, 1);
+    }
+    for (std::size_t i = 0; i < translation_unit_constructors_.size(); ++i)
+      emit_constructor_definition(translation_unit_constructors_[i], 1);
     out_ = 0;
   }
 
@@ -118,6 +138,11 @@ private:
   std::unordered_map<Id, std::unordered_map<std::string, pa6::BindingKind> >
       namespace_ordinary_kinds_;
   std::vector<GeneratedUnionConstructor> generated_union_constructors_;
+  std::vector<GeneratedUnionConstructor> translation_unit_constructors_;
+  std::unordered_map<Id, Id> member_definition_nodes_;
+  std::vector<Id> demanded_member_definitions_;
+  std::unordered_set<Id> demanded_member_set_;
+  std::unordered_map<Id, std::string> anonymous_type_names_;
 
   std::string text(Id node) const
   {
@@ -157,6 +182,36 @@ private:
 
   const pa6::Type& type(Id id) const { return unit_.type(id); }
 
+  void index_anonymous_types()
+  {
+    std::size_t next = 0;
+    for (Id node = 0; node < ast_.nodes.size(); ++node) {
+      if (ast_.nodes[node].kind != NClassSpecifier || ast_.nodes[node].composite != none)
+        continue;
+      Id class_type = unit_.type_for_node(node);
+      if (class_type == none || class_type >= unit_.type_count() ||
+          type(class_type).kind != pa6::NamedType) continue;
+      const Id entity = type(class_type).entity;
+      if (entity >= unit_.entity_count() || !unit_.entity(entity).is_anonymous ||
+          unit_.entity(entity).is_union || anonymous_type_names_.find(entity) !=
+              anonymous_type_names_.end()) continue;
+      std::ostringstream name;
+      name << "__local_type" << ++next;
+      anonymous_type_names_[entity] = name.str();
+    }
+  }
+
+  std::string class_name_for_output(Id entity) const
+  {
+    if (entity < unit_.entity_count()) {
+      const std::unordered_map<Id, std::string>::const_iterator found =
+          anonymous_type_names_.find(entity);
+      if (found != anonymous_type_names_.end()) return found->second;
+      return unit_.entity(entity).name;
+    }
+    return "<unknown>";
+  }
+
   std::string type_spelling(Id id) const
   {
     if (id == none || id >= unit_.type_count()) return "<invalid>";
@@ -171,8 +226,10 @@ private:
       Id owner = entity.scope;
       if (owner != none && (entity.kind == pa6::ClassEntity || entity.scoped_enum))
         owner = unit_.scope(owner).parent;
-      const std::string name = entity.kind == pa6::EnumEntity || owner == none || entity.name.empty()
-          ? entity.name : qualified_name(owner, entity.name);
+      const std::string display_name = entity.is_anonymous
+          ? class_name_for_output(t.entity) : entity.name;
+      const std::string name = entity.kind == pa6::EnumEntity || owner == none || display_name.empty()
+          ? display_name : qualified_name(owner, display_name);
       if (entity.kind == pa6::EnumEntity)
         return entity.scoped_enum ? "enum class " + name : "enum " + name;
       return entity.class_key + " " + name;
@@ -183,6 +240,9 @@ private:
       return qualifier + type_spelling(t.base);
     }
     case pa6::PointerType: return "pointer to " + type_spelling(t.base);
+    case pa6::MemberPointerType:
+      return "member-pointer of " + type_spelling(unit_.entity(t.entity).type) +
+          " to " + type_spelling(t.base);
     case pa6::LvalueReferenceType: return "lvalue-reference to " + type_spelling(t.base);
     case pa6::RvalueReferenceType: return "rvalue-reference to " + type_spelling(t.base);
     case pa6::ArrayType: {
@@ -200,7 +260,12 @@ private:
         if (!t.parameters.empty()) result += ", ";
         result += "...";
       }
-      return result + ") returning " + type_spelling(t.base);
+      result += ")";
+      if (t.member_const) result += " const";
+      if (t.member_volatile) result += " volatile";
+      if (t.ref_qualifier == pa6::LvalueRefQualifier) result += " &";
+      else if (t.ref_qualifier == pa6::RvalueRefQualifier) result += " &&";
+      return result + " returning " + type_spelling(t.base);
     }
     default: return unit_.type_spelling(id);
     }
@@ -403,7 +468,9 @@ private:
       if (record.kind == pa6::NamespaceScope && record.name != "<unnamed>")
         parts.push_back(record.name);
       else if (record.kind == pa6::ClassScope && !record.name.empty())
-        parts.push_back(record.name);
+        parts.push_back(record.entity < unit_.entity_count() &&
+                        unit_.entity(record.entity).is_anonymous
+                            ? class_name_for_output(record.entity) : record.name);
     }
     std::reverse(parts.begin(), parts.end());
     std::string result;
@@ -479,6 +546,79 @@ private:
       add_unique(result, id);
     }
     return result;
+  }
+
+  void collect_class_members(Id entity, const std::string& name,
+                             std::unordered_set<Id>& visited,
+                             std::vector<Id>& result) const
+  {
+    if (entity == none || entity >= unit_.entity_count() || !visited.insert(entity).second)
+      return;
+    const pa6::Entity& record = unit_.entity(entity);
+    if (record.scope == none) return;
+    const std::vector<Id> direct = direct_bindings(record.scope, name);
+    if (!direct.empty()) {
+      for (std::size_t i = 0; i < direct.size(); ++i) add_unique(result, direct[i]);
+      return;
+    }
+    for (std::size_t i = 0; i < record.bases.size(); ++i)
+      collect_class_members(record.bases[i], name, visited, result);
+  }
+
+  Id named_base_entity(Id entity, const std::string& qualifier) const
+  {
+    std::unordered_set<Id> visited;
+    std::vector<Id> pending(1, entity);
+    while (!pending.empty()) {
+      const Id current = pending.back();
+      pending.pop_back();
+      if (current == none || current >= unit_.entity_count() ||
+          !visited.insert(current).second) continue;
+      const pa6::Entity& record = unit_.entity(current);
+      for (std::size_t i = 0; i < record.bases.size(); ++i) {
+        const Id base = record.bases[i];
+        const pa6::Entity& base_record = unit_.entity(base);
+        const Id parent = base_record.scope == none ? none : unit_.scope(base_record.scope).parent;
+        const std::string full = parent == none ? base_record.name
+            : qualified_name(parent, base_record.name);
+        if (base_record.name == qualifier || full == qualifier) return base;
+        pending.push_back(base);
+      }
+    }
+    return none;
+  }
+
+  bool derives_from(Id derived, Id base,
+                    std::unordered_set<Id>& visited) const
+  {
+    if (derived == base) return true;
+    if (derived == none || derived >= unit_.entity_count() || !visited.insert(derived).second)
+      return false;
+    const std::vector<Id>& bases = unit_.entity(derived).bases;
+    for (std::size_t i = 0; i < bases.size(); ++i)
+      if (bases[i] == base || derives_from(bases[i], base, visited)) return true;
+    return false;
+  }
+
+  bool class_conversion_type(Id source, Id target, bool* added_cv = 0) const
+  {
+    if (source == none || target == none) return false;
+    const bool source_const = is_const(source), source_volatile = is_volatile(source);
+    const bool target_const = is_const(target), target_volatile = is_volatile(target);
+    if ((source_const && !target_const) || (source_volatile && !target_volatile))
+      return false;
+    const Id source_base = strip_cv(source), target_base = strip_cv(target);
+    if (type(source_base).kind != pa6::NamedType ||
+        type(target_base).kind != pa6::NamedType) return false;
+    const Id source_entity = type(source_base).entity;
+    const Id target_entity = type(target_base).entity;
+    if (source_entity == target_entity) return false;
+    std::unordered_set<Id> visited;
+    if (!derives_from(source_entity, target_entity, visited)) return false;
+    if (added_cv)
+      *added_cv = (!source_const && target_const) ||
+                  (!source_volatile && target_volatile);
+    return true;
   }
 
   void collect_directive_scope(Id scope, const std::string& name,
@@ -778,6 +918,8 @@ private:
     const pa6::Type& x = type(a);
     const pa6::Type& y = type(b);
     if (x.base != y.base || x.variadic != y.variadic ||
+        x.member_const != y.member_const || x.member_volatile != y.member_volatile ||
+        x.ref_qualifier != y.ref_qualifier ||
         x.parameters.size() != y.parameters.size()) return false;
     for (std::size_t i = 0; i < x.parameters.size(); ++i) {
       Id xp = strip_cv(x.parameters[i]);
@@ -795,7 +937,10 @@ private:
   {
     if (source.overloads.empty()) return none;
     target = strip_reference(target);
-    Id target_function = function_type_from(target);
+    const Id target_value = strip_cv(target);
+    const bool member_target = type(target_value).kind == pa6::MemberPointerType;
+    const Id target_class = member_target ? type(target_value).entity : none;
+    Id target_function = member_target ? type(target_value).base : function_type_from(target_value);
     if (target_function == none && is_function(target)) target_function = target;
     if (target_function == none) return none;
     Id selected = none;
@@ -803,10 +948,24 @@ private:
       const Id candidate = source.overloads[i];
       const Id candidate_type = canonical_function(unit_.binding(candidate).type);
       if (!same_function_type(candidate_type, target_function)) continue;
+      const pa6::Binding& binding = unit_.binding(candidate);
+      const pa6::ScopeRecord& owner = unit_.scope(binding.scope);
+      if (member_target) {
+        if (owner.kind != pa6::ClassScope || owner.entity != target_class) continue;
+      } else if (owner.kind == pa6::ClassScope) continue;
       if (selected != none) return none;
       selected = candidate;
     }
     return selected;
+  }
+
+  Id function_address_type(Id binding)
+  {
+    const Id function = canonical_function(unit_.binding(binding).type);
+    const pa6::ScopeRecord& owner = unit_.scope(unit_.binding(binding).scope);
+    if (owner.kind == pa6::ClassScope)
+      return unit_.member_pointer_type(owner.entity, function);
+    return unit_.pointer_type(function);
   }
 
   Conversion conversion(const ExpressionFact& source, Id target, Id node = none)
@@ -829,6 +988,8 @@ private:
         bool added = false;
         if (qualification_compatible(source.type, referent, &added))
           return Conversion(true, 0, added ? 1 : 0);
+        if (class_conversion_type(source.type, referent, &added))
+          return Conversion(true, 2, added ? 1 : 0);
       }
       if (same_unqualified(source.type, referent) &&
           ((is_const(source.type) && !is_const(referent)) ||
@@ -882,6 +1043,8 @@ private:
       if (pointer_qualification(source_type, target_value, 0, &added))
         return Conversion(true, 0, added ? 1 : 0);
       const Id su = strip_cv(source_pointee), tu = strip_cv(target_pointee);
+      if (class_conversion_type(source_pointee, target_pointee, &added))
+        return Conversion(true, 2, added ? 1 : 0);
       if (is_void(tu) && (type(su).kind != pa6::FunctionType) &&
           (!is_const(source_pointee) || is_const(target_pointee)) &&
           (!is_volatile(source_pointee) || is_volatile(target_pointee)))
@@ -1061,8 +1224,14 @@ private:
         const Id selected = resolve_function_overload(result, expected);
         if (selected == none) throw std::runtime_error("overloaded function name has no target match");
         result.binding = selected;
-        result.type = canonical_function(unit_.binding(selected).type);
-        result.category = LValue;
+        if (ast_.nodes[node].kind == NUnaryExpression && text(node) == "&") {
+          result.type = function_address_type(selected);
+          result.category = PRValue;
+        } else {
+          result.type = canonical_function(unit_.binding(selected).type);
+          result.category = LValue;
+        }
+        result.overloads.clear();
       }
       return result;
     }
@@ -1128,7 +1297,7 @@ private:
     } else if (kind == NCallExpression) {
       result = analyze_call(node, kids);
     } else if (kind == NUnaryExpression) {
-      result = analyze_unary(node, kids);
+      result = analyze_unary(node, kids, expected);
     } else if (kind == NPostfixExpression) {
       result = analyze_postfix(node, kids);
     } else if (kind == NBinaryExpression || kind == NAssignmentExpression) {
@@ -1151,27 +1320,53 @@ private:
       const Id selected = resolve_function_overload(result, expected);
       if (selected == none) throw std::runtime_error("overloaded function name has no target match");
       result.binding = selected;
-      result.type = canonical_function(unit_.binding(selected).type);
-      result.category = LValue;
+      if (kind == NUnaryExpression && text(node) == "&") {
+        result.type = function_address_type(selected);
+        result.category = PRValue;
+      } else {
+        result.type = canonical_function(unit_.binding(selected).type);
+        result.category = LValue;
+      }
       result.overloads.clear();
-      result.overloads.push_back(selected);
     }
     facts_[node] = result;
     fact_ready_[node] = true;
     return result;
   }
 
-  ExpressionFact analyze_unary(Id node, const std::vector<Id>& kids)
+  ExpressionFact analyze_unary(Id node, const std::vector<Id>& kids,
+                               Id expected = none)
   {
     if (kids.empty()) throw std::runtime_error("unary expression lacks an operand");
-    ExpressionFact operand = expression(kids[0]);
     const std::string op = text(node);
+    Id operand_expected = none;
+    if (op == "&" && expected != none) {
+      const Id target = strip_cv(strip_reference(expected));
+      if (type(target).kind == pa6::PointerType && is_function(type(target).base))
+        operand_expected = target;
+      else if (type(target).kind == pa6::MemberPointerType &&
+               is_function(type(target).base))
+        operand_expected = target;
+    }
+    ExpressionFact operand = expression(kids[0], operand_expected);
     ExpressionFact result;
     const Id t = strip_cv(operand.type);
     if (op == "&") {
+      if (operand.type == none && !operand.overloads.empty()) {
+        result.overloads = operand.overloads;
+        result.category = PRValue;
+        return result;
+      }
       if (operand.category == PRValue || operand.type == none)
         throw std::runtime_error("address-of requires an lvalue or function");
-      result.type = unit_.pointer_type(operand.type);
+      if (operand.binding != none &&
+          unit_.scope(unit_.binding(operand.binding).scope).kind == pa6::ClassScope)
+        result.type = unit_.member_pointer_type(
+            unit_.scope(unit_.binding(operand.binding).scope).entity, operand.type);
+      else result.type = unit_.pointer_type(operand.type);
+      if (operand.binding != none &&
+          unit_.binding(operand.binding).kind == pa6::FunctionBinding)
+        result.binding = operand.binding;
       result.category = PRValue;
     } else if (op == "*") {
       Id pointer = array_or_function_decay(t);
@@ -1456,7 +1651,7 @@ private:
   {
     if (kids.size() < 2) throw std::runtime_error("cast expression is incomplete");
     const Id target = unit_.resolve_type_node(kids[0], current_scope_);
-    ExpressionFact source = expression(kids[1]);
+    ExpressionFact source = expression(kids[1], target);
     const pa6::Type& target_type = type(target);
     if (target_type.kind == pa6::LvalueReferenceType ||
         target_type.kind == pa6::RvalueReferenceType) {
@@ -1474,6 +1669,20 @@ private:
       result.display_type = target;
       result.category = target_type.kind == pa6::LvalueReferenceType ? LValue : XValue;
       (void)node;
+      return result;
+    }
+    if (target_type.kind == pa6::MemberPointerType) {
+      if (strip_cv(source.type) != strip_cv(target))
+        throw std::runtime_error("invalid member-pointer cast");
+      ExpressionFact result;
+      result.type = target;
+      result.category = PRValue;
+      return result;
+    }
+    if (is_void(target)) {
+      ExpressionFact result;
+      result.type = target;
+      result.category = PRValue;
       return result;
     }
     if (!is_arithmetic(target) && !is_pointer(target) && !is_enum(target) && !is_void(target))
@@ -1502,26 +1711,48 @@ private:
   {
     if (kids.size() < 2) throw std::runtime_error("member expression is incomplete");
     ExpressionFact object = expression(kids[0]);
-    Id object_type = strip_cv(object.type);
+    Id object_type = object.type;
     const std::string op = text(node);
     if (op == "->") {
-      if (!is_pointer(object_type)) throw std::runtime_error("arrow requires a pointer");
-      object_type = type(object_type).base;
+      const Id pointer = strip_cv(object_type);
+      if (!is_pointer(pointer)) throw std::runtime_error("arrow requires a pointer");
+      object_type = type(pointer).base;
     }
-    if (type(strip_cv(object_type)).kind != pa6::NamedType)
+    const Id class_type = strip_cv(object_type);
+    if (type(class_type).kind != pa6::NamedType)
       throw std::runtime_error("member access requires a class object");
-    const Id entity = type(strip_cv(object_type)).entity;
-    const Id class_scope = unit_.entity(entity).scope;
-    const std::string member_name = text(kids[1]);
-    const std::vector<Id> found = direct_bindings(class_scope, member_name);
+    const Id entity = type(class_type).entity;
+    bool absolute = false;
+    const std::vector<std::string> parts = split_name(node_name(kids[1]), absolute);
+    if (parts.empty()) throw std::runtime_error("member expression has no member name");
+    const std::string member_name = parts.back();
+    Id lookup_entity = entity;
+    if (parts.size() > 1) {
+      std::string qualifier;
+      for (std::size_t i = 0; i + 1 < parts.size(); ++i) {
+        if (!qualifier.empty()) qualifier += "::";
+        qualifier += parts[i];
+      }
+      lookup_entity = named_base_entity(entity, qualifier);
+      if (lookup_entity == none) throw std::runtime_error("qualified member is not a base class");
+    }
+    std::unordered_set<Id> visited;
+    std::vector<Id> found;
+    collect_class_members(lookup_entity, member_name, visited, found);
     if (found.empty()) throw std::runtime_error("unknown class member");
     ExpressionFact result;
     result.binding = found[0];
-    result.type = unit_.binding(found[0]).type;
-    if (unit_.binding(found[0]).kind == pa6::FunctionBinding) {
+    const pa6::Binding& member = unit_.binding(found[0]);
+    result.type = member.type;
+    if (member.kind == pa6::FunctionBinding) {
       result.overloads = found;
       result.category = LValue;
-    } else result.category = object.category == XValue ? XValue : LValue;
+    } else {
+      if (!member.static_storage)
+        result.type = unit_.qualified_type(result.type,
+            is_const(object_type), is_volatile(object_type));
+      result.category = object.category == XValue ? XValue : LValue;
+    }
     (void)node;
     return result;
   }
@@ -1724,6 +1955,25 @@ private:
     const NodeKind kind = ast_.nodes[node].kind;
     const std::vector<Id> kids = children(node);
     std::ostringstream header;
+    if (expected != none && fact.type != none) {
+      const Id target = strip_cv(strip_reference(expected));
+      const Id source = strip_cv(fact.type);
+      if (type(target).kind == pa6::PointerType &&
+          type(source).kind == pa6::PointerType &&
+          class_conversion_type(type(source).base, type(target).base)) {
+        line(depth, "cast-expression prvalue " + type_spelling(target));
+        emit_expression(node, depth + 1);
+        return;
+      }
+      if ((type(expected).kind == pa6::LvalueReferenceType ||
+           type(expected).kind == pa6::RvalueReferenceType) &&
+          fact.category == LValue &&
+          class_conversion_type(fact.type, type(expected).base)) {
+        line(depth, "cast-expression lvalue " + type_spelling(type(expected).base));
+        emit_expression(node, depth + 1);
+        return;
+      }
+    }
     if (expected != none && fact.type != none &&
         (type(expected).kind == pa6::LvalueReferenceType ||
          type(expected).kind == pa6::RvalueReferenceType)) {
@@ -1769,8 +2019,13 @@ private:
           return;
         }
         const std::string name = node_name(node);
+        Id displayed_type = fact.type;
+        if (fact.binding != none &&
+            unit_.binding(fact.binding).kind == pa6::FunctionBinding &&
+            unit_.scope(unit_.binding(fact.binding).scope).kind == pa6::ClassScope)
+          displayed_type = function_dump_type(fact.binding);
         header << "id-expression " << category_name(fact.category) << ' '
-               << type_spelling(fact.type) << ' ' << name;
+               << type_spelling(displayed_type) << ' ' << name;
       }
       line(depth, header.str());
       return;
@@ -1819,7 +2074,13 @@ private:
       header << tag << category_name(fact.category) << ' ' << type_spelling(fact.type)
              << ' ' << token_label(node);
       line(depth, header.str());
-      for (std::size_t i = 0; i < kids.size(); ++i) emit_expression(kids[i], depth + 1);
+      if (kind == NUnaryExpression && text(node) == "&")
+        demand_member_definition(fact.binding);
+      for (std::size_t i = 0; i < kids.size(); ++i) {
+        if (kind == NUnaryExpression && text(node) == "&" && fact.binding != none)
+          emit_expression(kids[i], depth + 1, fact.type);
+        else emit_expression(kids[i], depth + 1);
+      }
       return;
     }
     if (kind == NBinaryExpression || kind == NAssignmentExpression) {
@@ -1827,7 +2088,12 @@ private:
              << category_name(fact.category) << ' ' << type_spelling(fact.type)
              << ' ' << token_label(node);
       line(depth, header.str());
-      for (std::size_t i = 0; i < kids.size(); ++i) emit_expression(kids[i], depth + 1);
+      for (std::size_t i = 0; i < kids.size(); ++i) {
+        if (kind == NAssignmentExpression && token_label(node) == "OP_ASS:=" &&
+            i == 1 && !kids.empty())
+          emit_expression(kids[i], depth + 1, expression(kids[0]).type);
+        else emit_expression(kids[i], depth + 1);
+      }
       return;
     }
     if (kind == NConditionalExpression) {
@@ -1860,6 +2126,15 @@ private:
     }
     if (kind == NCastExpression) {
       const Id target = unit_.resolve_type_node(kids[0], current_scope_);
+      const Id target_value = strip_cv(target);
+      if (kids.size() > 1 && ast_.nodes[kids[1]].kind == NUnaryExpression &&
+          text(kids[1]) == "&" &&
+          (type(target_value).kind == pa6::MemberPointerType ||
+           (type(target_value).kind == pa6::PointerType &&
+            is_function(type(target_value).base)))) {
+        emit_expression(kids[1], depth, target);
+        return;
+      }
       if (target != none &&
           (type(target).kind == pa6::LvalueReferenceType ||
            type(target).kind == pa6::RvalueReferenceType) && kids.size() > 1 &&
@@ -1884,7 +2159,11 @@ private:
       std::string member_operator = token_label(node);
       if (kids.size() > 1 && ast_.nodes[node].atom != none) {
         const ast_tokens::Token& op = ast_.tokens[ast_.nodes[node].atom];
-        member_operator = op.tag + ":" + node_name(kids.back());
+        bool absolute = false;
+        const std::vector<std::string> member_parts = split_name(node_name(kids.back()), absolute);
+        const std::string member_name = member_parts.empty()
+            ? node_name(kids.back()) : member_parts.back();
+        member_operator = op.tag + ":" + member_name;
       }
       header << "member-expression " << category_name(fact.category) << ' '
              << type_spelling(fact.type) << ' ' << member_operator;
@@ -1993,7 +2272,21 @@ private:
   {
     Id seq = ast_.nodes[node].first_child;
     Id list = seq == none ? none : ast_.nodes[seq].next_sibling;
-    if (list == none || ast_.nodes[list].kind != NInitDeclaratorList) return;
+    Id anonymous_union_spec = none;
+    for (Id spec = seq == none ? none : ast_.nodes[seq].first_child;
+         spec != none; spec = ast_.nodes[spec].next_sibling) {
+      if (ast_.nodes[spec].kind != NClassSpecifier || ast_.nodes[spec].composite != none)
+        continue;
+      for (Id key = ast_.nodes[spec].first_child; key != none;
+           key = ast_.nodes[key].next_sibling)
+        if (ast_.nodes[key].kind == NClassKey && text(key) == "union")
+          anonymous_union_spec = spec;
+    }
+    if (list == none || ast_.nodes[list].kind != NInitDeclaratorList) {
+      if (anonymous_union_spec != none)
+        emit_anonymous_union_storage(node, anonymous_union_spec, depth, true);
+      return;
+    }
     for (Id item = ast_.nodes[list].first_child; item != none; item = ast_.nodes[item].next_sibling) {
       const Id binding = unit_.binding_for_node(item);
       if (binding == none) continue;
@@ -2024,7 +2317,7 @@ private:
           const Id plain_type = strip_cv(b.type);
           emit_initializer(init, b.type, depth + 1,
                            constexpr_object && !is_pointer(plain_type));
-        }
+        } else emit_union_constructor(b.type, b.name, depth + 1, true);
       }
     }
   }
@@ -2055,6 +2348,43 @@ private:
     }
   }
 
+  Id function_dump_type(Id binding)
+  {
+    const Id function = canonical_function(unit_.binding(binding).type);
+    const pa6::ScopeRecord& owner = unit_.scope(unit_.binding(binding).scope);
+    if (owner.kind != pa6::ClassScope || owner.entity >= unit_.entity_count())
+      return function;
+    pa6::Type signature = type(function);
+    const Id class_type = unit_.entity(owner.entity).type;
+    const Id object_type = unit_.qualified_type(class_type,
+        signature.member_const, signature.member_volatile);
+    signature.parameters.insert(signature.parameters.begin(),
+                                unit_.pointer_type(object_type));
+    signature.member_const = false;
+    signature.member_volatile = false;
+    signature.ref_qualifier = pa6::NoRefQualifier;
+    return unit_.function_type(signature);
+  }
+
+  void emit_constructor_definition(const GeneratedUnionConstructor& constructor,
+                                   unsigned depth)
+  {
+    line(depth, "function-definition " + constructor.name + "::" + constructor.name + " " +
+         type_spelling(constructor.function_type));
+    line(depth + 1, "parameter this " + type_spelling(constructor.pointer_type));
+    line(depth + 1, "compound-statement");
+  }
+
+  void demand_member_definition(Id binding)
+  {
+    if (binding == none || binding >= unit_.binding_count() ||
+        unit_.binding(binding).kind != pa6::FunctionBinding ||
+        unit_.scope(unit_.binding(binding).scope).kind != pa6::ClassScope)
+      return;
+    if (demanded_member_set_.insert(binding).second)
+      demanded_member_definitions_.push_back(binding);
+  }
+
   void emit_function(Id node, unsigned depth)
   {
     const Id binding = unit_.binding_for_node(node);
@@ -2068,7 +2398,8 @@ private:
     Id declarator = ast_.nodes[node].first_child;
     declarator = declarator == none ? none : ast_.nodes[declarator].next_sibling;
     const std::string name = qualified_name(function.scope, function.name);
-    line(depth, "function-definition " + name + " " + type_spelling(signature_id));
+    const Id dump_signature = function_dump_type(binding);
+    line(depth, "function-definition " + name + " " + type_spelling(dump_signature));
     const Id clause = first_parameter_clause(declarator);
     const Id old_scope = current_scope_;
     const Id old_function_type = current_function_type_;
@@ -2076,6 +2407,9 @@ private:
     current_scope_ = unit_.scope_for_node(node);
     current_function_type_ = signature_id;
     push_environment();
+    if (unit_.scope(function.scope).kind == pa6::ClassScope &&
+        !type(dump_signature).parameters.empty())
+      line(depth + 1, "parameter this " + type_spelling(type(dump_signature).parameters[0]));
     std::size_t parameter_index = 0;
     if (clause != none) {
       for (Id p = ast_.nodes[clause].first_child; p != none; p = ast_.nodes[p].next_sibling) {
@@ -2096,12 +2430,11 @@ private:
     while (body != none && ast_.nodes[body].kind != NCompoundStatement)
       body = ast_.nodes[body].next_sibling;
     if (body != none) emit_statement(body, depth + 1);
-    for (std::size_t i = 0; i < generated_union_constructors_.size(); ++i) {
-      const GeneratedUnionConstructor& constructor = generated_union_constructors_[i];
-      line(depth, "function-definition " + constructor.name + "::" + constructor.name + " " +
-           type_spelling(constructor.function_type));
-      line(depth + 1, "parameter this " + type_spelling(constructor.pointer_type));
+    else if (unit_.scope(function.scope).kind == pa6::ClassScope &&
+             function.name == unit_.entity(unit_.scope(function.scope).entity).name)
       line(depth + 1, "compound-statement");
+    for (std::size_t i = 0; i < generated_union_constructors_.size(); ++i) {
+      emit_constructor_definition(generated_union_constructors_[i], depth);
     }
     generated_union_constructors_.clear();
     pop_environment();
@@ -2159,17 +2492,21 @@ private:
       const Id init = declarator == none ? none : ast_.nodes[declarator].next_sibling;
       if (init != none && b.kind == pa6::VariableBinding)
         emit_initializer(init, b.type, depth + 2);
+      else if (b.kind == pa6::VariableBinding && anonymous_union_spec == none)
+        emit_union_constructor(b.type, b.name, depth + 2);
     }
   }
 
-  void emit_anonymous_union_storage(Id declaration, Id specifier, unsigned depth)
+  void emit_anonymous_union_storage(Id declaration, Id specifier, unsigned depth,
+                                    bool top_level = false)
   {
     const std::string storage = unit_.anonymous_union_storage_name(declaration);
     const Id union_type = unit_.type_for_node(specifier);
-    line(depth, "simple-declaration");
+    if (!top_level) line(depth, "simple-declaration");
     if (storage.empty() || union_type == none) return;
-    line(depth + 1, "variable " + storage + " " + type_spelling(union_type));
-    emit_union_constructor(union_type, storage, depth + 2);
+    const unsigned member_depth = depth + (top_level ? 0 : 1);
+    line(member_depth, "variable " + storage + " " + type_spelling(union_type));
+    emit_union_constructor(union_type, storage, member_depth + 1, top_level);
     const pa6::Entity& entity = unit_.entity(type(union_type).entity);
     if (entity.scope != none) {
       const pa6::ScopeRecord& members = unit_.scope(entity.scope);
@@ -2186,14 +2523,18 @@ private:
   }
 
   void emit_union_constructor(Id union_type, const std::string& object,
-                              unsigned depth)
+                              unsigned depth, bool top_level = false)
   {
     union_type = strip_cv(strip_reference(union_type));
     if (union_type == none || type(union_type).kind != pa6::NamedType ||
         type(union_type).entity >= unit_.entity_count()) return;
     const pa6::Entity& entity = unit_.entity(type(union_type).entity);
-    if (entity.kind != pa6::ClassEntity || !entity.is_union) return;
-    const std::string name = entity.name;
+    if (entity.kind != pa6::ClassEntity || !entity.complete || entity.scope == none) return;
+    for (std::size_t i = 0; i < unit_.scope(entity.scope).bindings.size(); ++i) {
+      const pa6::Binding& member = unit_.binding(unit_.scope(entity.scope).bindings[i]);
+      if (member.kind == pa6::FunctionBinding && member.name == entity.name) return;
+    }
+    const std::string name = class_name_for_output(type(union_type).entity);
     const Id pointer = unit_.pointer_type(union_type);
     pa6::Type signature;
     signature.kind = pa6::FunctionType;
@@ -2205,14 +2546,16 @@ private:
     line(depth + 2, "callee " + name + "::" + name + " " + type_spelling(function));
     line(depth + 2, "unary-expression prvalue " + type_spelling(pointer) + " OP_AMP:&");
     line(depth + 3, "id-expression lvalue " + type_spelling(union_type) + " " + object);
-    for (std::size_t i = 0; i < generated_union_constructors_.size(); ++i)
-      if (generated_union_constructors_[i].type == union_type) return;
+    std::vector<GeneratedUnionConstructor>& constructors = top_level
+        ? translation_unit_constructors_ : generated_union_constructors_;
+    for (std::size_t i = 0; i < constructors.size(); ++i)
+      if (constructors[i].type == union_type) return;
     GeneratedUnionConstructor generated;
     generated.type = union_type;
     generated.pointer_type = pointer;
     generated.function_type = function;
     generated.name = name;
-    generated_union_constructors_.push_back(generated);
+    constructors.push_back(generated);
   }
 
   void emit_condition(Id node, unsigned depth, bool switch_condition)

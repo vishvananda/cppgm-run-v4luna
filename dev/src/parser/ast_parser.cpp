@@ -1355,7 +1355,7 @@ private:
       if (is(":") || has_colon_before_comma_or_semicolon())
         ast_.append(n, parse_bit_field(spec));
       else
-        ast_.append(n, parse_simple_after_spec(spec));
+        ast_.append(n, parse_simple_after_spec(spec, true));
     }
     if (name.spelling.empty() && tokens_[key].text == "union" && is(";"))
       ast_.nodes[n].source_end_token_index = pos_;
@@ -1817,9 +1817,9 @@ private:
   std::size_t parse_simple_or_function()
   {
     std::size_t spec = parse_decl_specifier_seq(true);
-    return parse_simple_after_spec(spec);
+    return parse_simple_after_spec(spec, false);
   }
-  std::size_t parse_simple_after_spec(std::size_t spec)
+  std::size_t parse_simple_after_spec(std::size_t spec, bool in_class)
   {
     names_.scopes.push_back(std::unordered_map<NameId, NameKind>());
     bool is_typedef = contains_decl_specifier(spec, "typedef");
@@ -1828,16 +1828,16 @@ private:
     std::size_t decl = none;
     if (!is(";")) {
       decl = parse_declarator(false);
-      if ((is("{") || is_keyword("try")) && contains_node_kind(decl, NParameterClause)) {
+      const bool defaulted = !in_class && is("=") && is_keyword("default", 1);
+      if ((is("{") || is_keyword("try") || defaulted) && contains_node_kind(decl, NParameterClause)) {
         std::size_t f = node(NFunctionDefinition);
         ast_.append(f, spec); ast_.append(f, decl);
         import_class_members_for_declarator(decl);
         std::size_t function_name = find_identifier_node(decl);
         if (function_name != none) bind_name(tokens_[function_name], ValueName);
-        if (is_keyword("try")) ast_.append(f, parse_function_try_block(false));
+        if (is_keyword("try")) ast_.append(f, parse_function_try_block(false)); else if (defaulted) { take(); ast_.append(f, node(NSpecialInitializer, take())); expect(";"); }
         else ast_.append(f, parse_compound_statement());
-        names_.scopes.pop_back();
-        return f;
+        names_.scopes.pop_back(); return f;
       }
       init_nodes.push_back(parse_init_declarator_tail(decl));
       while (consume(",")) init_nodes.push_back(parse_init_declarator_tail(parse_declarator(false)));

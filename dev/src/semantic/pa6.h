@@ -18,7 +18,7 @@ static const Id InvalidId = static_cast<Id>(-1);
 enum TypeKind {
   InvalidType, FundamentalType, NamedType, TemplateParameterType,
   QualifiedType, PointerType, LvalueReferenceType, RvalueReferenceType,
-  ArrayType, FunctionType
+  ArrayType, FunctionType, MemberPointerType
 };
 
 enum RefQualifier { NoRefQualifier, LvalueRefQualifier, RvalueRefQualifier };
@@ -75,10 +75,13 @@ struct Entity
   bool defined;
   bool scoped_enum;
   bool is_union;
+  bool is_anonymous;
   std::string class_key;
   Id underlying;
+  std::vector<Id> bases;
   Entity() : kind(ClassEntity), scope(InvalidId), type(InvalidId), complete(false),
-      defined(false), scoped_enum(false), is_union(false), underlying(InvalidId) {}
+      defined(false), scoped_enum(false), is_union(false), is_anonymous(false),
+      underlying(InvalidId) {}
 };
 
 struct Binding
@@ -134,6 +137,7 @@ public:
   Id fundamental_type(const std::string& name);
   Id qualified_type(Id type, bool is_const, bool is_volatile);
   Id pointer_type(Id type);
+  Id member_pointer_type(Id class_entity, Id member_type);
   Id lvalue_reference_type(Id type);
   Id rvalue_reference_type(Id type);
   Id array_type(Id type, long long bound);

@@ -2,8 +2,10 @@
 
 #include "support/not_implemented.h"
 #include "support/tool_help_text.h"
+#include "parser/ast_parser.h"
 
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -139,12 +141,55 @@ bool consume_joined_or_separate_option(const vector<string> & args,
   return false;
 }
 
-int run_not_implemented_batch_mode()
+int run_emit_ast_mode(const vector<string> & args);
+
+vector<string> split_batch_fields(const string & line)
 {
+  vector<string> fields;
+  size_t start = 0;
+  for(;;) {
+    size_t tab = line.find('\t', start);
+    fields.push_back(line.substr(start, tab == string::npos ? string::npos : tab - start));
+    if(tab == string::npos) break;
+    start = tab + 1;
+  }
+  return fields;
+}
+
+int run_batch_stdin(const vector<string> & raw_args)
+{
+  vector<string> base_args;
+  for(size_t i = 0; i < raw_args.size(); ++i) {
+    if(raw_args[i] != "--batch-stdin" && raw_args[i] != "--emit-ast")
+      base_args.push_back(raw_args[i]);
+  }
   string line;
   while(getline(cin, line)) {
-    (void)line;
-    cout << "EXIT_NOT_IMPLEMENTED" << endl;
+    if(!line.empty() && line[line.size() - 1] == '\r') line.erase(line.size() - 1);
+    if(line.empty()) continue;
+    vector<string> fields = split_batch_fields(line);
+    vector<string> args = base_args;
+    string error_path;
+    if(fields.size() == 3) {
+      error_path = fields[1];
+      args.push_back("-o"); args.push_back(fields[0]); args.push_back(fields[2]);
+    } else if(fields.size() >= 5) {
+      error_path = fields[1];
+      for(size_t i = 4; i < fields.size(); ++i) args.push_back(fields[i]);
+    } else {
+      cout << "EXIT_FAILURE" << endl;
+      continue;
+    }
+    ofstream error_file(error_path.c_str(), ios::out | ios::trunc);
+    streambuf * old_error = cerr.rdbuf();
+    if(error_file) cerr.rdbuf(error_file.rdbuf());
+    int status = EXIT_FAILURE;
+    try { status = run_emit_ast_mode(args); }
+    catch(const exception & e) { cerr << "ERROR: " << e.what() << endl; }
+    cerr.flush();
+    cerr.rdbuf(old_error);
+    if(error_file) error_file.close();
+    cout << (status == EXIT_SUCCESS ? "EXIT_SUCCESS" : "EXIT_FAILURE") << endl;
   }
   return EXIT_SUCCESS;
 }
@@ -382,7 +427,18 @@ int run_unimplemented_mode(const char * feature,
 int run_emit_ast_mode(const vector<string> & args)
 {
   parse_source_output_invocation(args, false);
-  return run_unimplemented_mode("--emit-ast", "PA5");
+  string output;
+  vector<string> inputs;
+  for(size_t i = 0; i < args.size(); ++i) {
+    if(args[i] == "-o") {
+      if(i + 1 >= args.size()) throw logic_error("missing output file after -o");
+      output = args[++i];
+    } else {
+      inputs.push_back(args[i]);
+    }
+  }
+  cppgm::EmitAst(inputs, output);
+  return EXIT_SUCCESS;
 }
 
 int run_emit_types_mode(const vector<string> & args)
@@ -422,7 +478,7 @@ int run_driver_mode(const vector<string> & args)
 int run_cppgm(const vector<string> & raw_args)
 {
   if(has_arg(raw_args, "--batch-stdin")) {
-    return run_not_implemented_batch_mode();
+    return run_batch_stdin(raw_args);
   }
 
   if(has_help_arg(raw_args)) {

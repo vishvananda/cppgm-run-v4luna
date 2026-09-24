@@ -1,4 +1,254 @@
-# PA7 implementation handoff
+# PA7 final architecture and audit
+
+Audit status: complete. Final implementation commit: `b8909126`.
+Pre-audit checkpoint: `1407bbc5b98e5c5ddc9163037b3b778192a7afd1`.
+PA7 base: `7b753b22f0f53a30e038e6775b276e9ce36ec5fc`.
+Reviewed stage lineage: `b9220620` (semantic dump), `42b1657e` (member and
+conversion semantics), `f36ecbf7` (type-only function templates), `27623a37`
+(specialization cache identity), and `1407bbc5` (checkpoint evidence).
+
+## Contract and final design
+
+PA7 implements `cppgm++ --emit-semantics`. It parses each input once through
+the shared preprocessing/token cursor and PA5 AST, moves that AST into the PA6
+`SemanticUnit`, constructs canonical types, entities, bindings and scopes, then
+walks the same source-faithful graph to analyze expressions and print the
+deterministic PA7 dump. No phase transports semantic data through textual AST,
+type or LowIR output. Each translation unit owns its graph and PA7 facts; the
+`SemanticDumper` and its temporary caches are destroyed before the next input
+translation unit is analyzed.
+
+PA6 indexes scope declarations by interned name ID and stores semantic identity
+as IDs. PA7 consumes structured name paths and indexed binding sequences rather
+than reparsing rendered names. It filters the complete-TU PA6 index through a
+source-order visibility state, with explicit using-directive and inline
+namespace edges. Inline namespace children are indexed once when built. Small
+candidate sets preserve source order; larger deduplication sets use flat ID
+tables. Base traversal follows entity IDs and indexed base edges.
+
+The dumper computes expression type, value category, binding, constant and
+overload facts; applies the supported conversion rules; records a selected call
+and its argument targets; then renders from the AST in source order. A single
+AST pass indexes function definitions and template declarators. Deferred member
+definitions and function-template instances are deduplicated by identity and
+emitted in deterministic first-demand order. Call facts use an open-addressed
+node-to-packed-fact table with expected O(1) lookup, avoiding one hash-map node
+allocation per call. The table and its facts live only for the current
+translation unit. Candidate ranking is O(C×A + V²×A) for C candidates, A
+arguments and V viable candidates; arity and declaration-shape filters run
+before conversion ranking.
+
+Representative ownership traces:
+
+- `choose(long)` declared before `run`, then `choose(int)` declared later:
+  PA6 indexes both bindings, PA7 exposes only the first at `run`'s source point,
+  ranks the visible candidate, records that binding and conversion, and prints
+  the resolved call. The valid trace is in
+  `student.tests/pa7-point-of-declaration.cpp`.
+- An enum forward declaration creates the enum identity, but its scoped
+  enumerator binding is not visible until its enumerator-definition. The
+  `Choice::ready` use before the definition now fails; the independent reduced
+  case is `student.tests/pa7-enumerator-point-of-declaration-bad.cpp`.
+- For a type-only lookup hidden by a direct non-type declaration, the direct
+  declaration stops lookup before a using-directive or inline namespace can
+  supply a same-spelled type. The reduced case is
+  `student.tests/pa7-type-only-lookup-hiding-bad.cpp`.
+- A type-only function-template instance is keyed by primary function binding
+  and ordered canonical type-argument IDs. Argument deduction is separated
+  from type substitution; a cache hit does not repeat substitution. The
+  selected synthetic binding and call conversions remain per call site. This
+  is a tested PA7 extension; general body instantiation is not implemented.
+
+## Findings and changes
+
+- PA6 had a complete-TU declaration index, so later locals, using-directives,
+  namespace names and enumerators could leak into earlier lookup. PA7 now marks
+  declarations when the source walk reaches their C++ point of declaration and
+  filters every relevant lookup path through that visibility state. Local
+  namespace aliases are installed into the local environment; anonymous enum
+  declarations bind their enumerators and emit the required simple-declaration
+  record.
+- Type-only lookup previously discarded a direct non-type declaration and
+  continued into nominated namespaces. It now lets that direct declaration
+  hide fallback candidates, after which the caller checks whether the result
+  is a type.
+- Scope lookup no longer scans every child scope to find inline namespaces.
+  Binding-candidate, base-graph and demand membership use flat compact-ID
+  structures. A direct cache comparison of the flat call-fact table against the
+  former `unordered_map` showed no repeatable latency change; the flat table is
+  retained for compact identity indexing and to remove per-call hash-node
+  allocations. Its measured tradeoff is recorded below.
+- Template specialization success identity now includes the primary binding
+  and canonical ordered arguments. Context-dependent expression facts are not
+  cached as context-free results. No negative specialization results are
+  cached, so there is no invalidation path to become stale.
+- `pa7.cpp` is 2,999 lines, within the file audit's 3,000-line limit. New
+  lookup and AST-shape helpers are in `pa7_lookup.*` and `pa7_ast.*`, and both
+  sources are registered for `cppgm++` in `dev/frontend_source_sets.mk`.
+
+The point-of-declaration fixes follow C++11 N3485: §3.3.2/1 places an ordinary
+declaration's point after its complete declarator and before its initializer;
+§3.3.2/4 places an enumerator's point after its enumerator-definition;
+§3.3.8/1 bounds a scoped enumerator's potential scope; §3.4.1/1 stops lookup
+when a declaration is found; §3.4.1/6 requires namespace names to be declared
+before use; §7.3.4/2 makes a using-directive effective after its appearance;
+§3.3.7/1 supplies the complete-class-context rule used for member bodies.
+Reduced source cases, not compiler agreement, establish the fixes. No checked
+reference output required correction, and no reference bundle was revised.
+
+## Performance evidence and acceptance
+
+The frozen baseline is `compiler-a` from commit
+`1407bbc5b98e5c5ddc9163037b3b778192a7afd1`, SHA256
+`c2cf0fcbfe9d9d7876af0c858c413a063a3219cad37f34e99e2a20169f910499`. The
+final candidate is the exact audited source, SHA256
+`bc8f6ef4bf728fa3a7510231e7c6523ea3680fe8bbd53158972fa0fdf1b37608`.
+Both were built with g++ 15.2.0, `-std=gnu++11 -Wall -O3 -pthread`, on x86-64
+Intel Xeon 2.20 GHz hardware (32 logical CPUs). Each workload is one fixed
+source translation unit, timed as a separate process with semantic output
+directed to `/dev/null`. There are eight A/A pairs per variant, eight
+baseline/current/current/baseline blocks, and three peak-RSS samples per
+variant. A/A pair-delta ranges show the observed timing noise. The template
+declarator run includes one A/A outlier; all eight paired blocks still favor
+the candidate. Host load varied during the audit, so the paired spreads and
+A/A calibration govern these claims.
+
+| Fixed compiler corpus (bytes) | A → B median wall time (ms) | Paired B/A median (range), faster blocks | Same-binary pair-delta ranges (A; B) | Peak RSS A / B KiB, median [range] |
+| --- | ---: | --- | --- | --- |
+| `scope-lookup.cpp` (243,020) | 2671.4 → 229.7 | −91.10% [−91.43%, −90.80%], 8/8 | A −7.45% to +4.16%; B −1.80% to +17.92% | 39,232 [39,088–39,272] / 39,148 [39,080–39,512] |
+| `template-specializations.cpp` (268,416) | 244.8 → 247.9 | +1.68% [−0.18%, +3.27%], 1/8 | A −4.76% to +5.43%; B −2.61% to +2.29% | 47,124 [47,084–47,280] / 46,940 [46,760–47,256] |
+| `template-declarator-index.cpp` (592,037) | 3633.9 → 447.0 | −87.63% [−88.21%, −87.46%], 8/8 | A −5.17% to +58.28%; B −2.76% to +2.15% | 74,700 [74,400–74,840] / 74,796 [74,600–74,900] |
+| `inline-namespace-lookup.cpp` (328,082) | 3090.0 → 1756.6 | −44.17% [−46.61%, −39.07%], 8/8 | A −5.08% to +0.73%; B −10.47% to +8.61% | 29,284 [29,248–29,300] / 28,600 [28,484–29,484] |
+
+The template-specialization workload shows a small directional slowdown; its
+paired range overlaps the same-binary A/A range, so it is not a stable
+regression claim. The other three workloads show repeatable reductions. RSS
+samples overlap and show no material stage-wide increase. The final compiler
+ELF `.text` is 930,390 bytes versus 909,398 (+20,992 bytes, +2.31%); `.rodata`
+is +712 bytes, `.data` is unchanged and `.bss` is +72 bytes. This is compiler
+text size. PA7 produces semantic text dumps, not executables, so generated
+program runtime and generated-code size are not applicable at this stage. No
+numeric PA7 latency or RSS cap is specified in the assignment or `spec.md`;
+no threshold was invented. The existing report-and-file-audit requirements,
+correctness, coverage and this measured tradeoff are the acceptance criteria.
+
+PA7 constructs no LowIR, MIR or executable code and has no optimization pass
+pipeline. Optimizer transform legality/profitability, rewrite invalidation and
+per-level pipeline work/code-growth budgets therefore do not apply here. The
+relevant semantic caches are TU-scoped: expression facts are cached only when
+no expected type is supplied, call facts are tied to immutable AST call IDs,
+and successful type-only template instances use the complete primary-binding
+and ordered-canonical-argument key. There is no negative template cache or
+fixed-point retry loop. Function-definition/template-declarator indexing is one
+AST pass; anonymous-type naming is a separate AST pass. Lookup and ranking work
+follows the visible declarations, nominated namespace edges and actual
+candidates.
+
+The dense AST-wide call-slot experiment was rejected: its candidate peak RSS
+was 40,144 KiB on scope lookup and 76,644 KiB on template declarator indexing,
+versus 39,204 and 74,780 KiB for A in that run. The retained flat node-to-fact
+index sizes its table according to actual call facts. In a direct eight-block
+comparison against the former call-map compiler, its latency medians were
++1.18% (scope), +0.51% (template specializations), +0.74% (template
+declarator) and −1.37% (inline namespace), all within paired/A/A noise.
+Peak-RSS medians differed by +804,
+−160, +28 and +140 KiB respectively. This refactor is not claimed as a
+runtime optimization; it replaces per-call map-node allocation with bounded
+flat storage, with the measured memory cost disclosed.
+
+Raw observations and frozen artifacts are preserved outside the checkout:
+
+- Final A/B: `/home/vishvananda/work/private/v4luna/artifacts/pa7-final-audit-flat-calls/`.
+  `run-abba.py` SHA256 `eb47c0efbf743b2393cbef9b34f6e29c96d99c77292fb43cd5e1a7e5ced13965`;
+  `run-abba-targeted.py` SHA256 `39064af0c35ab02357c69a5e1d31d0f423181c7dd3742710278ef9b3b439bd2c`.
+  Raw timing TSV SHA256: inline `9b48b73ef93397f449cad8ff071eae4500371f1cd5144cb7a3ef1ef46ee65484`,
+  scope `e9f90d020395bcab2523a6218261019b81a5f5dd4a1478bc1dd867fd6bf4c411`,
+  template declarator `32e51576932e5a7aa68f5ea8275b1b477c443720bbf482547c5aa2101ec89a64`,
+  template specializations `309d44a768e2419072bee2e69eb08cd0d79d5c426001cb9d2c93fafa684924f3`.
+  RSS TSV SHA256: inline `025441078ec9d055f5408750fef93ad23d2d589dbfdd231a8c96bd0b65212d72`,
+  scope `b95523f27358968e0d57a0d951c14a34c6ec4f65a04cccc54440b3dffc5a207d`,
+  template declarator `f8090fbc2ebf7f2ac6350eaa416512263c6c690a7ce722382c0ca403021346b4`,
+  template specializations `c8133c0a5a9a6c030f24234177e83f95ba62781f7ca8f252d27dccf8348f0243`.
+- Direct old-map/flat-table comparison: `/home/vishvananda/work/private/v4luna/artifacts/pa7-call-cache-comparison/`;
+  A (old map) SHA256 `6d284f92401c100ae1067986f03c3aa62f73bae4d7eba3634284c1991b657ada`,
+  B (flat table) SHA256 `bc8f6ef4bf728fa3a7510231e7c6523ea3680fe8bbd53158972fa0fdf1b37608`.
+  Script SHA256: `run-abba.py` `cd81ee24d4340971d576733e0c5bd461a0f7bca9a97d403692880d3bb465e399`,
+  `run-abba-targeted.py` `ddd8e012361f983d96cca08b206abc386c235d90fd78405956f06601fc721a1f`.
+  Timing TSV SHA256: inline `b3ddc76e8a881c4640673a774667c62f5b75fe9ec7f23eb9021893d5597c60be`,
+  scope `8ccb550d1f0d7262ae8369cbd16ce9e3ecf544cc2004ea0ef0275721eaa9cf5b`,
+  template declarator `728b6265c5997e126879c16cc618c8bee85b61137a60a3b6d4099c71f904f111`,
+  template specializations `4e8229a2b9201b0185cf481385816b08a43ee8c2d2f7769b572fc057bc2c4a78`.
+  RSS TSV SHA256: inline `d69375aa73416330ce2c6cad33dc07301faf31ff8f517528af9c5db3a184fc49`,
+  scope `cae506ef2d2019cfb3c755467a77fd44434e26312cb1e5b4387890c330c76372`,
+  template declarator `64c1d1904ab189fe6b1e71920f3e0422564b960a705ab584f64ac594b0f2604f`,
+  template specializations `77831ce02cc19b01377fafa78e1460dee31fe1d17da8ff130de07ef2cc13af65`.
+- The prior source-order candidate A/B run remains at
+  `/home/vishvananda/work/private/v4luna/artifacts/pa7-final-audit/` (candidate
+  SHA256 `6d284f92401c100ae1067986f03c3aa62f73bae4d7eba3634284c1991b657ada`;
+  `run-abba.py` SHA256 `8a36466aed4fd8e3591bb755280b095e46889192e52a82ff09a24fa5c71279ec`,
+  targeted runner SHA256 `680df7433df31ce1a9650838ccca291514b6522d9da051589fc87fc036634131`).
+  Its four timing TSVs and four RSS TSVs are preserved there; the later flat-call
+  run above is the final acceptance measurement.
+- Dense-slot rejected experiment:
+  `/home/vishvananda/work/private/v4luna/artifacts/pa7-final-audit-packed-calls/`
+  (candidate SHA256 `38c209f67dd6c434bde95fd3d04a5689e5ac245bdaa52a585bad58bced1c0201`).
+  Its four timing TSVs and four RSS TSVs are preserved there; this version used
+  an AST-sized slot vector and is not the retained design.
+- Final corpus SHA256: scope `a37cea6074cc7c7231c0f0d2318a90c29073d5e9731375f4931f93246aa20be8`,
+  template specializations `c201442334f3fe17b7e557db8c1d3e19fcdf1ddb8f0d3e83a8247016baab8e0d`,
+  template declarator `92b744b6fdc4bca1b25f0783d7cde7fc63e6196a9983b7a11fd61b5202105e42`,
+  inline namespace `7e3a17f37395397e2930cc80ec91d8b1c3ca31fc10016c5a3d766e2ad22623be`.
+  A/B semantic-output hashes matched respectively: `8a61aff7ee3cfa3880a208e7adece315a1cb660a7fb792b9acdeb46424ddefd1`,
+  `9a1623109db5c525d4938103ac8e8539ece5e0bcc1fdf3fca56eae21ef97f60d`,
+  `5b74fc074143268b9fee3373ccc2e193cd5166eb284895dcc8c2921a99a674d6`,
+  `c8a995a6f30e7940ecd126c7ff72078538a5083184b9dc4f390969a9726eaad1`.
+
+## Final validation ledger
+
+- `perl scripts/cppgm_file_audit.pl --stage pa7 --paths dev/src`: pass, 43
+  files; `semantic/pa7.cpp` is 2,999 lines.
+- `make test-pa7`: 186/186 pass.
+- Required `make test-report-through-pa7`: pass, 684/684 tests, all seven
+  stages. The full primary log is
+  `/home/vishvananda/work/.ralph/v4luna-gpt-6-luna-max/last-test.log`.
+- Personal point-of-declaration valid output matches its checked expected
+  output. The later-using-directive, pre-definition scoped-enumerator and
+  direct-non-type-hides-imported-type reproducers each fail as required.
+  Existing `student.tests/pa7-function-template-deduction.cpp` also passed
+  explicitly.
+- `git diff --check` and staged-diff checks passed. No course fixture,
+  reference output, coverage rule or comparison rule changed.
+
+## Final handoff ledger
+
+No PA6→PA7 handoff remains unaudited. Structured source names, canonical type
+IDs, tag/enum bindings, scope/name indexes, inline namespace edges and source
+declaration order were traced into PA7 lookup. No reference correction or
+bundle revision was required.
+
+The audited future-stage boundaries are:
+
+- PA7 `ExpressionFact`, `CallFact`, conversion and selected-call data are
+  dumper-local and end with the semantic dump. PA10 source lowering must move
+  required selected declarations, conversions, value categories, constants,
+  object identities and lifetime actions into durable typed lowering facts;
+  it must not reconstruct those decisions from dump text.
+- PA7's simple derived-to-base handling walks class entity IDs but does not
+  model access, ambiguous/virtual base subobjects or full class-aware
+  conversion ranking. The tested PA7 subset remains supported; class/object
+  model work belongs to later class stages.
+- PA7's type-only function-template extension does not instantiate dependent
+  bodies, non-type arguments or member templates. General template demand and
+  body reuse remain with PA14–PA19.
+- PA7 has no executable output, so runtime and generated-code-size coverage
+  begins with lowering/backend stages. Later fixed benchmark suites must add
+  loops, calls, memory, floating point and self-hosting alongside compiler
+  latency and peak RSS.
+
+The former independent-audit markers in the checkpoint below are resolved by
+this audit; they are not remaining PA7 exit gates.
+
+## Historical checkpoint record (preserved)
 
 Stage base commit: `7b753b22f0f53a30e038e6775b276e9ce36ec5fc`
 Last reviewed commit: `7b753b22f0f53a30e038e6775b276e9ce36ec5fc`
@@ -115,15 +365,13 @@ calibrated summaries were 5-TU 5.892 vs 5.827 ms (−0.60%; range −6.34% to
 - 50-TU A/A `[25.435/25.450,25.238/25.389,25.447/24.564,24.203/23.606,23.823/24.541,24.586/24.061,26.305/24.419,24.349/25.875]`; ABBA `[23.685/25.209,24.871/23.505,24.765/24.994,24.850/23.672,23.379/24.037,24.285/24.157,23.656/23.979,25.306/25.305,24.551/25.636,24.250/24.301]`.
 - Inherited peak-RSS samples, KiB: 5-TU current `[4700,4760,4692]`, prior `[4900,4780,4688]`; 50-TU current `[4604,4940,4932]`, prior `[4648,4668,4664]`.
 
-## Handoff ledger
+## Historical checkpoint handoff ledger
 
 - **Unfinished PA7 implementation:** none in the required slice. General
   template bodies, non-type template arguments and member templates remain
   future-stage work, consistent with PA7's out-of-scope boundary.
-- **Independent audit:** retain whole-stage review of target-directed overload
+- **Independent audit:** the whole-stage review of target-directed overload
   resolution, derived-to-base cast materialization, deferred member-definition
-  ordering, and extension of cached AST-node facts through later class-aware
-  stages. These are review markers, not waived requirements; no new known defect
-  remains in the required PA7 slice.
-- No reference corrections were needed. Ralph's full-stage audit must resolve
-  any whole-stage findings before advancement.
+  ordering and AST-fact lifetimes is completed in the final audit above.
+- No reference corrections were needed. The final exit ledger is at the top of
+  this plan.
